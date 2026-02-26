@@ -226,16 +226,16 @@ public class PlaneEntity extends AbstractRCEntity
 	}
 
 	@Override
-	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	public void remoteControlAnalogInput(float lx, float ly, float rx, float ry, float l2, float r2, boolean r1, boolean l1, boolean r3, boolean l3, boolean buttonA, boolean buttonB, boolean buttonX, boolean buttonY, boolean buttonStart, boolean buttonSelect, boolean padUp, boolean padDown, boolean padLeft, boolean padRight)
 	{
 		// IMPORTANT: do NOT call super.remoteControlAnalogInput(...) here,
 		// because it converts analog -> legacy booleans and calls remoteControlInput(),
 		// which fights our real analog controls.
-		storeAnalogInput(pitch, roll, yaw, throttle, brake);
+		storeAnalogInput(lx, ly, rx, ry, l2, r2, r1, l1, r3, l3, buttonA, buttonB, buttonX, buttonY, buttonStart, buttonSelect, padUp, padDown, padLeft, padRight);
 
-		this.pitchAnalog = Mth.clamp(pitch, -1.0f, 1.0f);
-		this.rollAnalog = Mth.clamp(roll, -1.0f, 1.0f);
-		this.throttleControlAnalog = Mth.clamp(throttle, -1.0f, 1.0f);
+		this.pitchAnalog = Mth.clamp(ly, -1.0f, 1.0f);
+		this.rollAnalog = Mth.clamp(-lx, -1.0f, 1.0f);
+		this.throttleControlAnalog = Mth.clamp(-ry, -1.0f, 1.0f);
 	}
 
 	@Override

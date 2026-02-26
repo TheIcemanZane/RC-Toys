@@ -166,18 +166,18 @@ public class CarEntity extends AbstractRCEntity
 	}
 
 	@Override
-	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	public void remoteControlAnalogInput(float lx, float ly, float rx, float ry, float l2, float r2, boolean r1, boolean l1, boolean r3, boolean l3, boolean buttonA, boolean buttonB, boolean buttonX, boolean buttonY, boolean buttonStart, boolean buttonSelect, boolean padUp, boolean padDown, boolean padLeft, boolean padRight)
 	{
 		// IMPORTANT: do NOT call super.remoteControlAnalogInput(...) here,
 		// because it converts analog -> legacy booleans and calls remoteControlInput(),
 		// which fights our real analog controls.
-		storeAnalogInput(pitch, roll, yaw, throttle, brake);
+		storeAnalogInput(lx, ly, rx, ry, l2, r2, r1, l1, r3, l3, buttonA, buttonB, buttonX, buttonY, buttonStart, buttonSelect, padUp, padDown, padLeft, padRight);
 
 		// Throttle: prefer dedicated throttle axis, fall back to pitch if that’s how it’s mapped
-		float t = -pitch;
+		float t = -ly;
 
 		// Steering: prefer yaw axis, fall back to roll if that’s how it’s mapped
-		float s = -yaw;
+		float s = -rx;
 
 		this.throttleAnalog = Mth.clamp(t, -1.0f, 1.0f);
 		this.steeringAnalog = Mth.clamp(s, -1.0f, 1.0f);

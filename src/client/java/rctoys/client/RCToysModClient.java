@@ -16,6 +16,8 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.phys.Vec3;
 import org.lwjgl.glfw.GLFW;
+
+import rctoys.client.input.ControllerSupport.AnalogState;
 import rctoys.RCToysMod;
 import rctoys.client.command.RCToysClientCommands;
 import rctoys.client.input.ControllerSupport;
@@ -48,7 +50,7 @@ public class RCToysModClient implements ClientModInitializer
 	private static final int BIT_SHIFT = 5;
 
 	private static int lastInput = -1;
-	private static AnalogSnapshot lastAnalog = new AnalogSnapshot();
+	private static ControllerSupport.AnalogState lastAnalog = new AnalogState();
 	public static UUID fpvUUID;
 
 	private static boolean controllerInit = false;
@@ -93,8 +95,8 @@ public class RCToysModClient implements ClientModInitializer
 			var cfg = rctoys.client.input.ControllerConfig.load();
 
 			// Apply invert config to ControllerSupport each tick (hot-edit friendly)
-			ControllerSupport.INVERT_PITCH = cfg.invertPitch;
-			ControllerSupport.INVERT_ROLL  = cfg.invertRoll;
+			ControllerSupport.INVERT_LX  = cfg.invertRoll;
+			ControllerSupport.INVERT_LY = cfg.invertPitch;
 
 			int jid = rctoys.client.input.ControllerManager.findJidByGuid(cfg.selectedGuid)
 					.orElseGet(() -> rctoys.client.input.ControllerManager.firstConnected()
@@ -122,18 +124,28 @@ public class RCToysModClient implements ClientModInitializer
 					// --- analog controller input ---
 					ControllerSupport.AnalogState a = ControllerSupport.readAnalog();
 					if (a.present) {
-						AnalogSnapshot snap = AnalogSnapshot.from(a);
-
-						if (snap.shouldSendComparedTo(lastAnalog)) {
-							ClientPlayNetworking.send(new RemoteControlAnalogC2SPacket(
-									snap.pitch,
-									snap.roll,
-									snap.yaw,
-									snap.throttle,
-									snap.brake
-							));
-							lastAnalog = snap;
-						}
+						ClientPlayNetworking.send(new RemoteControlAnalogC2SPacket(
+						a.lx,
+						a.ly,
+						a.rx,
+						a.ry,
+						a.l2,
+						a.r2,
+						a.r1,
+						a.l1,
+						a.r3,
+						a.l3,
+						a.buttonA,
+						a.buttonB,
+						a.buttonX,
+						a.buttonY,
+						a.buttonStart,
+						a.buttonSelect,
+						a.padUp,
+						a.padDown,
+						a.padLeft,
+						a.padRight
+						));
 					}
 
 					// Block vanilla movement while holding remote
@@ -197,7 +209,7 @@ public class RCToysModClient implements ClientModInitializer
 			}
 
 			lastInput = -1;
-			lastAnalog = new AnalogSnapshot(); // reset
+			lastAnalog = new AnalogState(); // reset
 			fpvUUID = null;
 		});
 	}
@@ -227,44 +239,5 @@ public class RCToysModClient implements ClientModInitializer
 		client.player.setYBodyRot(yaw);
 
 		client.player.setXRot(pitch);
-	}
-
-	/**
-	 * Small helper to rate-limit analog packets.
-	 */
-	private static final class AnalogSnapshot {
-		private static final float STEP = 1.0f / 64.0f;
-		private static final float EPS_SEND = STEP * 0.5f;
-
-		public float pitch = 0.0f;
-		public float roll = 0.0f;
-		public float yaw = 0.0f;
-		public float throttle = 0.0f;
-		public boolean brake = false;
-
-		public static AnalogSnapshot from(ControllerSupport.AnalogState a) {
-			AnalogSnapshot s = new AnalogSnapshot();
-			s.pitch = quant(a.pitch);
-			s.roll = quant(a.roll);
-			s.yaw = quant(a.yaw);
-			s.throttle = quant(a.throttle);
-			s.brake = a.brake;
-			return s;
-		}
-
-		public boolean shouldSendComparedTo(AnalogSnapshot prev) {
-			if (this.brake != prev.brake) return true;
-
-			return Math.abs(this.pitch - prev.pitch) > EPS_SEND
-					|| Math.abs(this.roll - prev.roll) > EPS_SEND
-					|| Math.abs(this.yaw - prev.yaw) > EPS_SEND
-					|| Math.abs(this.throttle - prev.throttle) > EPS_SEND;
-		}
-
-		private static float quant(float v) {
-			if (v < -1.0f) v = -1.0f;
-			if (v > 1.0f) v = 1.0f;
-			return Math.round(v / STEP) * STEP;
-		}
 	}
 }

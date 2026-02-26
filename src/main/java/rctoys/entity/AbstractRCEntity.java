@@ -48,11 +48,26 @@ public abstract class AbstractRCEntity extends Entity
 	private static final EntityDataAccessor<Float> THROTTLE = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.FLOAT);
 
 	// --- Analog control state (server-side) ---
-	protected float ctrlPitch;     // -1..1
-	protected float ctrlRoll;      // -1..1
-	protected float ctrlYaw;       // -1..1
-	protected float ctrlThrottle;  // -1..1
-	protected boolean ctrlBrake;
+	protected float lx;
+	protected float ly;
+	protected float rx;
+	protected float ry;
+	protected float l2;
+	protected float r2;
+	protected boolean r1;
+	protected boolean l1;
+	protected boolean r3;
+	protected boolean l3;
+	protected boolean buttonA;
+	protected boolean buttonB;
+	protected boolean buttonX;
+	protected boolean buttonY;
+	protected boolean buttonStart;
+	protected boolean buttonSelect;
+	protected boolean padUp;
+	protected boolean padDown;
+	protected boolean padLeft;
+	protected boolean padRight;
 	protected int ctrlTicksSinceUpdate = 0;
 
 	private final InterpolationHandler interpolator = new InterpolationHandler(this, 3);
@@ -194,41 +209,37 @@ public abstract class AbstractRCEntity extends Entity
 	 * Subclasses that implement real analog handling should call this,
 	 * NOT the fallback mapping.
 	 */
-	protected final void storeAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	protected final void storeAnalogInput(float lx, float ly, float rx, float ry, float l2, float r2, boolean r1, boolean l1, boolean r3, boolean l3, boolean buttonA, boolean buttonB, boolean buttonX, boolean buttonY, boolean buttonStart, boolean buttonSelect, boolean padUp, boolean padDown, boolean padLeft, boolean padRight)
 	{
-		this.ctrlPitch = clamp11(pitch);
-		this.ctrlRoll = clamp11(roll);
-		this.ctrlYaw = clamp11(yaw);
-		this.ctrlThrottle = clamp11(throttle);
-		this.ctrlBrake = brake;
-		this.ctrlTicksSinceUpdate = 0;
+		this.lx = lx;
+		this.ly = ly;
+		this.rx = rx;
+		this.ry = ry;
+		this.l2 = l2;
+		this.r2 = r2;
+		this.r1 = r1;
+		this.l1 = l1;
+		this.r3 = r3;
+		this.l3 = l3;
+		this.buttonA = buttonA;
+		this.buttonB = buttonB;
+		this.buttonX = buttonX;
+		this.buttonY = buttonY;
+		this.buttonStart = buttonStart;
+		this.buttonSelect = buttonSelect;
+		this.padUp = padUp;
+		this.padDown = padDown;
+		this.padLeft = padLeft;
+		this.padRight = padRight;
 	}
 
 	/**
 	 * Analog control entrypoint (default behavior):
 	 * Store state, then convert analog -> legacy 6 booleans and call remoteControlInput(...).
 	 */
-	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	public void remoteControlAnalogInput(float lx, float ly, float rx, float ry, float l2, float r2, boolean r1, boolean l1, boolean r3, boolean l3, boolean buttonA, boolean buttonB, boolean buttonX, boolean buttonY, boolean buttonStart, boolean buttonSelect, boolean padUp, boolean padDown, boolean padLeft, boolean padRight)
 	{
-		storeAnalogInput(pitch, roll, yaw, throttle, brake);
-
-		boolean[] input = new boolean[6];
-
-		// NOTE: This mapping is "generic legacy" and may not match PlaneEntity's meaning.
-		input[0] = this.ctrlPitch > 0.25f;   // up
-		input[1] = this.ctrlPitch < -0.25f;  // down
-		input[2] = this.ctrlRoll < -0.25f;   // left
-		input[3] = this.ctrlRoll > 0.25f;    // right
-		input[4] = this.ctrlThrottle > 0.25f;   // jump
-		input[5] = this.ctrlThrottle < -0.25f;  // shift
-
-		remoteControlInput(input);
-	}
-
-	protected static float clamp11(float v) {
-		if (v < -1.0f) return -1.0f;
-		if (v > 1.0f) return 1.0f;
-		return v;
+		storeAnalogInput(lx, ly, rx, ry, l2, r2, r1, l1, r3, l3, buttonA, buttonB, buttonX, buttonY, buttonStart, buttonSelect, padUp, padDown, padLeft, padRight);
 	}
 
 	public abstract Item asItem();
@@ -429,11 +440,26 @@ public abstract class AbstractRCEntity extends Entity
 				if(entity instanceof AbstractRCEntity rc && rc.isEnabled())
 				{
 					rc.remoteControlAnalogInput(
-							payload.pitch(),
-							payload.roll(),
-							payload.yaw(),
-							payload.throttle(),
-							payload.brake()
+					payload.lx(),
+					payload.ly(),
+					payload.rx(),
+					payload.ry(),
+					payload.l2(),
+					payload.r2(),
+					payload.r1(),
+					payload.l1(),
+					payload.r3(),
+					payload.l3(),
+					payload.buttonA(),
+					payload.buttonB(),
+					payload.buttonX(),
+					payload.buttonY(),
+					payload.buttonStart(),
+					payload.buttonSelect(),
+					payload.padUp(),
+					payload.padDown(),
+					payload.padLeft(),
+					payload.padRight()
 					);
 				}
 			}

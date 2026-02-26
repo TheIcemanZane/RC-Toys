@@ -17,7 +17,7 @@ public final class ControllerConfig {
 
     /** New: per-axis inversion options. */
     public boolean invertPitch = false;
-    public boolean invertRoll = true;
+    public boolean invertRoll = false;
 
     public static ControllerConfig load() {
         Path file = filePath();

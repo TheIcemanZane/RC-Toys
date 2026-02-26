@@ -10,15 +10,21 @@ import net.fabricmc.fabric.api.client.rendering.v1.EntityModelLayerRegistry;
 import net.fabricmc.fabric.api.client.rendering.v1.EntityRendererRegistry;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.KeyMapping;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.model.geom.ModelLayerLocation;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
+import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.phys.Vec3;
+import org.lwjgl.glfw.GLFW;
+
+import client.java.rctoys.client.input.ControllerSupport.AnalogState;
 import rctoys.RCToysMod;
+import rctoys.client.command.RCToysClientCommands;
 import rctoys.client.input.ControllerSupport;
 import rctoys.client.input.GamepadMappings;
 import rctoys.client.input.RCToyKeybinds;
-import rctoys.client.command.RCToysClientCommands;
 import rctoys.client.render.entity.CarEntityRenderer;
 import rctoys.client.render.entity.PlaneEntityRenderer;
 import rctoys.client.render.entity.model.CarEntityModel;
@@ -30,10 +36,8 @@ import rctoys.network.c2s.MotorSoundS2CPacket;
 import rctoys.network.c2s.RemoteControlAnalogC2SPacket;
 import rctoys.network.c2s.RemoteControlC2SPacket;
 import rctoys.network.c2s.TrackingPlayerC2SPacket;
-import org.lwjgl.glfw.GLFW;
 
 import java.util.UUID;
-
 
 public class RCToysModClient implements ClientModInitializer
 {
@@ -48,11 +52,19 @@ public class RCToysModClient implements ClientModInitializer
 	private static final int BIT_SHIFT = 5;
 
 	private static int lastInput = -1;
-	private static AnalogSnapshot lastAnalog = new AnalogSnapshot();
+	private static AnalogState lastAnalog = new AnalogState();
 	public static UUID fpvUUID;
 
 	private static boolean controllerInit = false;
 	private static rctoys.client.input.ControllerConfig controllerConfig;
+
+	// Toggles
+	public static boolean FACE_VEHICLE_ENABLED = false;
+	public static boolean REAR_CAMERA_ENABLED = true;
+
+	// NEW: rear cam pitch offset (negative = look up, positive = look down).
+	// You asked for "slightly above the plane" -> we look a bit UP so the view centers above it.
+	public static float REAR_CAMERA_PITCH_OFFSET_DEG = -12.0f;
 
 	@Override
 	public void onInitializeClient()
@@ -77,14 +89,21 @@ public class RCToysModClient implements ClientModInitializer
 			GamepadMappings.ensureConfigExists();
 
 			if (!controllerInit) {
-    		    controllerInit = true;
-    		    controllerConfig = rctoys.client.input.ControllerConfig.load();
-    		}
-		
-    		// resolve selection each tick (handles disconnect/reconnect)
+				controllerInit = true;
+				controllerConfig = rctoys.client.input.ControllerConfig.load();
+			}
+
+			// resolve selection each tick (handles disconnect/reconnect)
 			var cfg = rctoys.client.input.ControllerConfig.load();
-			int jid = rctoys.client.input.ControllerManager.findJidByGuid(cfg.selectedGuid).orElseGet(() -> rctoys.client.input.ControllerManager.firstConnected().orElse(org.lwjgl.glfw.GLFW.GLFW_JOYSTICK_1));
-    		rctoys.client.input.ControllerSupport.JOYSTICK_ID = jid;
+
+			// Apply invert config to ControllerSupport each tick (hot-edit friendly)
+			ControllerSupport.INVERT_PITCH = cfg.invertPitch;
+			ControllerSupport.INVERT_ROLL  = cfg.invertRoll;
+
+			int jid = rctoys.client.input.ControllerManager.findJidByGuid(cfg.selectedGuid)
+					.orElseGet(() -> rctoys.client.input.ControllerManager.firstConnected()
+							.orElse(org.lwjgl.glfw.GLFW.GLFW_JOYSTICK_1));
+			rctoys.client.input.ControllerSupport.JOYSTICK_ID = jid;
 
 			if(client.player != null && client.level != null && client.player.getMainHandItem().getComponents().has(RCToysMod.REMOTE_LINK))
 			{
@@ -105,23 +124,30 @@ public class RCToysModClient implements ClientModInitializer
 					if (RCToyKeybinds.SHIFT.isDown())   input |= (1 << BIT_SHIFT);
 
 					// --- analog controller input ---
-					// We send analog if a controller is present AND there's meaningful analog movement,
-					// OR if we sent analog previously (to keep updates flowing while you hold an input).
 					ControllerSupport.AnalogState a = ControllerSupport.readAnalog();
-					boolean controllerAnalogPresent = a.present;
 					if (a.present) {
-						AnalogSnapshot snap = AnalogSnapshot.from(a);
-
-						if (snap.shouldSendComparedTo(lastAnalog)) {
-							ClientPlayNetworking.send(new RemoteControlAnalogC2SPacket(
-									snap.pitch,
-									snap.roll,
-									snap.yaw,
-									snap.throttle,
-									snap.brake
-							));
-							lastAnalog = snap;
-						}
+						ClientPlayNetworking.send(new RemoteControlAnalogC2SPacket(
+						a.lx,
+						a.ly,
+						a.rx,
+						a.ry,
+						a.l2,
+						a.r2,
+						a.r1,
+						a.l1,
+						a.r3,
+						a.l3,
+						a.buttonA,
+						a.buttonB,
+						a.buttonX,
+						a.buttonY,
+						a.buttonStart,
+						a.buttonSelect,
+						a.padUp,
+						a.padDown,
+						a.padLeft,
+						a.padRight
+						));
 					}
 
 					// Block vanilla movement while holding remote
@@ -137,7 +163,7 @@ public class RCToysModClient implements ClientModInitializer
 						lastInput = input;
 					}
 
-					// Toggle FPV (rebindable)
+					// Toggle FPV
 					while (RCToyKeybinds.TOGGLE_FPV.consumeClick())
 					{
 						if(fpvUUID == null)
@@ -146,6 +172,31 @@ public class RCToysModClient implements ClientModInitializer
 							fpvUUID = null;
 
 						ClientPlayNetworking.send(new TrackingPlayerC2SPacket(entity.getId(), fpvUUID != null));
+					}
+
+					// Toggle "face vehicle"
+					while (RCToyKeybinds.TOGGLE_FACE_VEHICLE.consumeClick()) {
+						FACE_VEHICLE_ENABLED = !FACE_VEHICLE_ENABLED;
+						client.player.displayClientMessage(
+								Component.literal("[rctoys] Face vehicle: " + (FACE_VEHICLE_ENABLED ? "ON" : "OFF"))
+										.withStyle(FACE_VEHICLE_ENABLED ? ChatFormatting.GREEN : ChatFormatting.RED),
+								true
+						);
+					}
+
+					// Toggle "rear camera in FPV third-person"
+					while (RCToyKeybinds.TOGGLE_REAR_CAMERA.consumeClick()) {
+						REAR_CAMERA_ENABLED = !REAR_CAMERA_ENABLED;
+						client.player.displayClientMessage(
+								Component.literal("[rctoys] Rear camera (FPV+F5): " + (REAR_CAMERA_ENABLED ? "ON" : "OFF"))
+										.withStyle(REAR_CAMERA_ENABLED ? ChatFormatting.GREEN : ChatFormatting.RED),
+								true
+						);
+					}
+
+					// Apply "face vehicle" every tick while controlling (yaw + pitch)
+					if (FACE_VEHICLE_ENABLED) {
+						facePlayerToEntity(client, entity);
 					}
 
 					return;
@@ -160,51 +211,36 @@ public class RCToysModClient implements ClientModInitializer
 			}
 
 			lastInput = -1;
-			lastAnalog = new AnalogSnapshot(); // reset
+			lastAnalog = new AnalogState(); // reset
 			fpvUUID = null;
 		});
 	}
 
-	/**
-	 * Small helper to rate-limit analog packets.
-	 */
-	private static final class AnalogSnapshot {
-		// Quantized values reduce packet spam
-		private static final float STEP = 1.0f / 64.0f; // ~0.0156
-		private static final float EPS_SEND = STEP * 0.5f;
+	private static void facePlayerToEntity(Minecraft client, Entity target) {
+		if (client.player == null) return;
 
-		public float pitch = 0.0f;
-		public float roll = 0.0f;
-		public float yaw = 0.0f;
-		public float throttle = 0.0f;
-		public boolean brake = false;
+		// aim from player eye -> target eye-ish (target center + eyeHeight)
+		Vec3 from = client.player.getEyePosition();
+		Vec3 to = target.position().add(0.0, target.getEyeHeight(), 0.0);
 
-		public static AnalogSnapshot from(ControllerSupport.AnalogState a) {
-			AnalogSnapshot s = new AnalogSnapshot();
-			s.pitch = quant(a.pitch);
-			s.roll = quant(a.roll);
-			s.yaw = quant(a.yaw);
-			s.throttle = quant(a.throttle);
-			s.brake = a.brake;
-			return s;
-		}
+		double dx = to.x - from.x;
+		double dy = to.y - from.y;
+		double dz = to.z - from.z;
 
-		public boolean shouldSendComparedTo(AnalogSnapshot prev) {
-			// Only send if changed enough OR brake toggled
-			if (this.brake != prev.brake) return true;
+		double horiz = Math.sqrt(dx * dx + dz * dz);
+		if (horiz < 1.0e-6) return;
 
-			return Math.abs(this.pitch - prev.pitch) > EPS_SEND
-				|| Math.abs(this.roll - prev.roll) > EPS_SEND
-				|| Math.abs(this.yaw - prev.yaw) > EPS_SEND
-				|| Math.abs(this.throttle - prev.throttle) > EPS_SEND;
-		}
+		// yaw: atan2(z, x) - 90
+		float yaw = (float)(Mth.atan2(dz, dx) * (180.0 / Math.PI)) - 90.0f;
 
-		private static float quant(float v) {
-			// clamp + snap to STEP
-			if (v < -1.0f) v = -1.0f;
-			if (v > 1.0f) v = 1.0f;
-			return Math.round(v / STEP) * STEP;
-		}
+		// pitch: -atan2(dy, horiz) (MC pitch: +down, -up)
+		float pitch = (float)(-Mth.atan2(dy, horiz) * (180.0 / Math.PI));
+
+		client.player.setYRot(yaw);
+		client.player.setYHeadRot(yaw);
+		client.player.setYBodyRot(yaw);
+
+		client.player.setXRot(pitch);
 	}
 }
 -------------------------------------------
@@ -353,6 +389,10 @@ public final class ControllerConfig {
     /** Empty = auto-pick first connected. */
     public String selectedGuid = "";
 
+    /** New: per-axis inversion options. */
+    public boolean invertPitch = false;
+    public boolean invertRoll = true;
+
     public static ControllerConfig load() {
         Path file = filePath();
         if (Files.isRegularFile(file)) {
@@ -488,30 +528,40 @@ public final class ControllerSupport {
 	// Deadzone for sticks (applied after inversion)
 	public static float DEADZONE = 0.12f;
 
-	// Axes (defaults: left stick for roll/pitch)
-	public static int AXIS_ROLL = GLFW.GLFW_GAMEPAD_AXIS_LEFT_X;   // left(-) / right(+)
-	public static int AXIS_PITCH = GLFW.GLFW_GAMEPAD_AXIS_LEFT_Y;  // up(-) / down(+)
+	// Sticks
+	public static int AXIS_LX = GLFW.GLFW_GAMEPAD_AXIS_LEFT_X;
+	public static int AXIS_LY = GLFW.GLFW_GAMEPAD_AXIS_LEFT_Y;
+	public static int AXIS_RX = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_X;
+	public static int AXIS_RY = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_Y;
 
-	// Throttle: choose ONE approach.
-	// Option A: right stick Y as throttle delta (simple, works everywhere)
-	public static int AXIS_THROTTLE = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_Y;
+	public static int BUTTON_R3 = GLFW.GLFW_GAMEPAD_BUTTON_RIGHT_THUMB;
+	public static int BUTTON_L3 = GLFW.GLFW_GAMEPAD_BUTTON_LEFT_THUMB;
 
-	// Option B (later): triggers as absolute throttle (needs more logic), keep for future:
-	// public static int AXIS_TRIGGER_LEFT  = GLFW.GLFW_GAMEPAD_AXIS_LEFT_TRIGGER;
-	// public static int AXIS_TRIGGER_RIGHT = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER;
-
-	// Optional yaw (not used by plane physics yet, but packet supports it)
-	public static int AXIS_YAW = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_X;
+	// Triggers
+	public static int AXIS_L2 = GLFW.GLFW_GAMEPAD_AXIS_LEFT_TRIGGER;
+	public static int AXIS_R2 = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER;
+	public static int BUTTON_L1 = GLFW.GLFW_GAMEPAD_BUTTON_LEFT_BUMPER;
+	public static int BUTTON_R1 = GLFW.GLFW_GAMEPAD_BUTTON_RIGHT_BUMPER;
 
 	// Inversion toggles
-	public static boolean INVERT_PITCH = false;  // many people prefer stick up = pitch up
-	public static boolean INVERT_ROLL = true;
-	public static boolean INVERT_THROTTLE = true; // stick up usually negative
+	public static boolean INVERT_LX = false;
+	public static boolean INVERT_LY = false;
+	public static boolean INVERT_RX = false;
+	public static boolean INVERT_RY = false;
+
+	// D-Pad
+	public static int DPAD_UP = GLFW.GLFW_GAMEPAD_BUTTON_DPAD_UP;
+	public static int DPAD_DOWN = GLFW.GLFW_GAMEPAD_BUTTON_DPAD_DOWN;
+	public static int DPAD_LEFT = GLFW.GLFW_GAMEPAD_BUTTON_DPAD_LEFT;
+	public static int DPAD_RIGHT = GLFW.GLFW_GAMEPAD_BUTTON_DPAD_RIGHT;
 
 	// Buttons
-	public static int BUTTON_BRAKE = GLFW.GLFW_GAMEPAD_BUTTON_LEFT_BUMPER; // arbitrary default
-	public static int BUTTON_JUMP  = GLFW.GLFW_GAMEPAD_BUTTON_A;
-	public static int BUTTON_SHIFT = GLFW.GLFW_GAMEPAD_BUTTON_B;
+	public static int BUTTON_A  = GLFW.GLFW_GAMEPAD_BUTTON_A;
+	public static int BUTTON_B = GLFW.GLFW_GAMEPAD_BUTTON_B;
+	public static int BUTTON_X = GLFW.GLFW_GAMEPAD_BUTTON_X;
+	public static int BUTTON_Y = GLFW.GLFW_GAMEPAD_BUTTON_Y;
+	public static int BUTTON_START = GLFW.GLFW_GAMEPAD_BUTTON_START;
+	public static int BUTTON_SELECT = GLFW.GLFW_GAMEPAD_BUTTON_SELECT;
 
 	private static final GLFWGamepadState STATE = GLFWGamepadState.create();
 
@@ -527,31 +577,47 @@ public final class ControllerSupport {
 
 		out.present = true;
 
-		float roll = STATE.axes(AXIS_ROLL);
-		float pitch = STATE.axes(AXIS_PITCH);
-		float throttle = STATE.axes(AXIS_THROTTLE);
-		float yaw = STATE.axes(AXIS_YAW);
+		float lx = STATE.axes(AXIS_LX);
+		float ly = STATE.axes(AXIS_LY);
+		float rx = STATE.axes(AXIS_RX);
+		float ry = STATE.axes(AXIS_RY);
+		float l2 = STATE.axes(AXIS_L2);
+		float r2 = STATE.axes(AXIS_R2);
 
-		if (INVERT_ROLL) roll = -roll;
-		if (INVERT_PITCH) pitch = -pitch;
-		if (INVERT_THROTTLE) throttle = -throttle;
+		if(INVERT_LX) lx = -lx;
+		if(INVERT_LY) ly = -ly;
+		if(INVERT_RX) rx = -rx;
+		if(INVERT_RY) ry = -ry;
 
-		out.roll = applyDeadzone(roll);
-		out.pitch = applyDeadzone(pitch);
-		out.throttle = applyDeadzone(throttle);
-		out.yaw = applyDeadzone(yaw);
+		out.lx = applyDeadzone(lx);
+		out.ly = applyDeadzone(ly);
+		out.rx = applyDeadzone(rx);
+		out.ry = applyDeadzone(ry);
 
-		out.brake = STATE.buttons(BUTTON_BRAKE) == GLFW.GLFW_PRESS;
-		out.jump  = STATE.buttons(BUTTON_JUMP) == GLFW.GLFW_PRESS;
-		out.shift = STATE.buttons(BUTTON_SHIFT) == GLFW.GLFW_PRESS;
+		out.buttonStart = STATE.buttons(BUTTON_START) == GLFW.GLFW_PRESS;
+		out.buttonSelect = STATE.buttons(BUTTON_SELECT) == GLFW.GLFW_PRESS;
+
+		out.buttonA = STATE.buttons(BUTTON_A) == GLFW.GLFW_PRESS;
+		out.buttonB = STATE.buttons(BUTTON_B) == GLFW.GLFW_PRESS;
+		out.buttonX = STATE.buttons(BUTTON_X) == GLFW.GLFW_PRESS;
+		out.buttonY = STATE.buttons(BUTTON_Y) == GLFW.GLFW_PRESS;
+
+		out.l1 = STATE.buttons(BUTTON_L1) == GLFW.GLFW_PRESS;
+		out.r1 = STATE.buttons(BUTTON_R1) == GLFW.GLFW_PRESS;
+
+		out.l3 = STATE.buttons(BUTTON_L3) == GLFW.GLFW_PRESS;
+		out.r3 = STATE.buttons(BUTTON_R3) == GLFW.GLFW_PRESS;
+
+		out.padUp = STATE.buttons(DPAD_UP) == GLFW.GLFW_PRESS;
+		out.padDown = STATE.buttons(DPAD_DOWN) == GLFW.GLFW_PRESS;
+		out.padLeft = STATE.buttons(DPAD_LEFT) == GLFW.GLFW_PRESS;
+		out.padRight = STATE.buttons(DPAD_RIGHT) == GLFW.GLFW_PRESS;
 
 		return out;
 	}
 
 	private static float applyDeadzone(float v) {
 		if (Math.abs(v) < DEADZONE) return 0.0f;
-
-		// Optional rescale so it smoothly starts after deadzone
 		float sign = Math.signum(v);
 		float mag = (Math.abs(v) - DEADZONE) / (1.0f - DEADZONE);
 		return sign * clamp01(mag);
@@ -565,74 +631,26 @@ public final class ControllerSupport {
 
 	public static final class AnalogState {
 		public boolean present = false;
-		public float pitch = 0.0f;    // -1..1
-		public float roll = 0.0f;     // -1..1
-		public float yaw = 0.0f;      // -1..1
-		public float throttle = 0.0f; // -1..1 (delta)
-		public boolean brake = false;
-
-		// optional digital buttons (if you want them)
-		public boolean jump = false;
-		public boolean shift = false;
-	}
-
-	public static final class AnalogDebugState {
-	    public boolean present = false;
-	
-	    // raw values straight from GLFW state (no invert, no deadzone)
-	    public float rawPitch, rawRoll, rawYaw, rawThrottle;
-	
-	    // processed values (invert + deadzone + rescale)
-	    public float pitch, roll, yaw, throttle;
-	
-	    public boolean brake, jump, shift;
-	
-	    // extra info
-	    public boolean isGamepad = false;
-	    public int jid = GLFW.GLFW_JOYSTICK_1;
-	}
-	
-	public static AnalogDebugState readAnalogDebug() {
-	    AnalogDebugState out = new AnalogDebugState();
-	    out.jid = JOYSTICK_ID;
-	
-	    if (!ENABLED) return out;
-	    if (!GLFW.glfwJoystickPresent(JOYSTICK_ID)) return out;
-	
-	    out.isGamepad = GLFW.glfwJoystickIsGamepad(JOYSTICK_ID);
-	    if (!out.isGamepad) return out;
-	
-	    if (!GLFW.glfwGetGamepadState(JOYSTICK_ID, STATE)) return out;
-	
-	    out.present = true;
-	
-	    // raw
-	    float roll = STATE.axes(AXIS_ROLL);
-	    float pitch = STATE.axes(AXIS_PITCH);
-	    float throttle = STATE.axes(AXIS_THROTTLE);
-	    float yaw = STATE.axes(AXIS_YAW);
-	
-	    out.rawRoll = roll;
-	    out.rawPitch = pitch;
-	    out.rawThrottle = throttle;
-	    out.rawYaw = yaw;
-	
-	    // apply invert
-	    if (INVERT_ROLL) roll = -roll;
-	    if (INVERT_PITCH) pitch = -pitch;
-	    if (INVERT_THROTTLE) throttle = -throttle;
-	
-	    // processed
-	    out.roll = applyDeadzone(roll);
-	    out.pitch = applyDeadzone(pitch);
-	    out.throttle = applyDeadzone(throttle);
-	    out.yaw = applyDeadzone(yaw);
-	
-	    out.brake = STATE.buttons(BUTTON_BRAKE) == GLFW.GLFW_PRESS;
-	    out.jump  = STATE.buttons(BUTTON_JUMP) == GLFW.GLFW_PRESS;
-	    out.shift = STATE.buttons(BUTTON_SHIFT) == GLFW.GLFW_PRESS;
-	
-	    return out;
+		public float lx = 0.0f;
+		public float ly = 0.0f;
+		public float rx = 0.0f;
+		public float ry = 0.0f;
+		public float l2 = 0.0f;
+		public float r2 = 0.0f;
+		public boolean r1 = false;
+		public boolean l1 = false;
+		public boolean r3 = false;
+		public boolean l3 = false;
+		public boolean buttonA = false;
+		public boolean buttonB = false;
+		public boolean buttonX = false;
+		public boolean buttonY = false;
+		public boolean buttonStart = false;
+		public boolean buttonSelect = false;
+		public boolean padUp = false;
+		public boolean padDown = false;
+		public boolean padLeft = false;
+		public boolean padRight = false;
 	}
 }
 -------------------------------------------
@@ -761,11 +779,9 @@ import rctoys.RCToysMod;
  * Rebindable RC controls that show up in Options -> Controls.
  */
 public final class RCToyKeybinds {
-    // Custom category (newer MC uses a Category object, not a String)
     public static final KeyMapping.Category CATEGORY =
         KeyMapping.Category.register(Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "controls"));
 
-    // Mirrors old behavior by default (WASD/Space/Shift) but now configurable.
     public static KeyMapping FORWARD;
     public static KeyMapping BACK;
     public static KeyMapping LEFT;
@@ -773,8 +789,11 @@ public final class RCToyKeybinds {
     public static KeyMapping JUMP;
     public static KeyMapping SHIFT;
 
-    // Replaces hardcoded V
     public static KeyMapping TOGGLE_FPV;
+
+    // NEW:
+    public static KeyMapping TOGGLE_FACE_VEHICLE;
+    public static KeyMapping TOGGLE_REAR_CAMERA;
 
     private RCToyKeybinds() {}
 
@@ -787,6 +806,10 @@ public final class RCToyKeybinds {
         SHIFT   = register("key.rctoys.shift",   GLFW.GLFW_KEY_LEFT_SHIFT);
 
         TOGGLE_FPV = register("key.rctoys.toggle_fpv", GLFW.GLFW_KEY_V);
+
+        // Defaults chosen to not conflict with common movement:
+        TOGGLE_FACE_VEHICLE = register("key.rctoys.toggle_face_vehicle", GLFW.GLFW_KEY_B);
+        TOGGLE_REAR_CAMERA  = register("key.rctoys.toggle_rear_camera",  GLFW.GLFW_KEY_N);
     }
 
     private static KeyMapping register(String translationKey, int defaultKey) {
@@ -1224,7 +1247,6 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import net.fabricmc.api.EnvType;
@@ -1274,16 +1296,37 @@ public abstract class CameraMixin
         if(RCToysModClient.fpvUUID != null && client.level != null) {
             Entity fpvEntity = client.level.getEntity(RCToysModClient.fpvUUID);
 
-            if(fpvEntity != null && fpvEntity instanceof AbstractRCEntity) {
-                if(bl) {
+            if(fpvEntity instanceof AbstractRCEntity rc) {
+
+                boolean useRearThirdPerson = bl && RCToysModClient.REAR_CAMERA_ENABLED;
+
+                if (useRearThirdPerson) {
+                    // Third-person FPV camera follows RC orientation and is tilted so it aims slightly above the vehicle.
+                    float partialTicks = client.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+
+                    Quaternionf q = rc.getLerpedQuaternion(partialTicks);
+
+                    // Apply pitch offset (degrees -> radians).
+                    float offRad = RCToysModClient.REAR_CAMERA_PITCH_OFFSET_DEG * Mth.DEG_TO_RAD;
+                    q = new Quaternionf(q).rotateX(offRad);
+
+                    this.rotation.set(q);
+                    FORWARDS.rotate(this.rotation, this.forwards);
+                    UP.rotate(this.rotation, this.up);
+                    LEFT.rotate(this.rotation, this.left);
+
+                    // Do NOT apply bl2 "front view" flip; rear cam is forced
+                } else if (bl) {
+                    // Normal third-person behavior based on the player view
                     this.setRotation(entity.getViewYRot(f), entity.getViewXRot(f));
 
                     if(bl2)
                         this.setRotation(this.yRot + 180.0f, -this.xRot);
                 } else {
-                    // Point the camera in the forward direction while in FPV mode.
+                    // First-person FPV mode: camera points forward with the RC quaternion
                     float partialTicks = client.getDeltaTracker().getGameTimeDeltaPartialTick(false);
-                    Quaternionf quaternion = ((AbstractRCEntity) fpvEntity).getLerpedQuaternion(partialTicks);
+                    Quaternionf quaternion = rc.getLerpedQuaternion(partialTicks);
+
                     this.rotation.set(quaternion);
                     FORWARDS.rotate(this.rotation, this.forwards);
                     UP.rotate(this.rotation, this.up);
@@ -1549,11 +1592,26 @@ public abstract class AbstractRCEntity extends Entity
 	private static final EntityDataAccessor<Float> THROTTLE = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.FLOAT);
 
 	// --- Analog control state (server-side) ---
-	protected float ctrlPitch;     // -1..1
-	protected float ctrlRoll;      // -1..1
-	protected float ctrlYaw;       // -1..1
-	protected float ctrlThrottle;  // -1..1
-	protected boolean ctrlBrake;
+	protected float lx;
+	protected float ly;
+	protected float rx;
+	protected float ry;
+	protected float l2;
+	protected float r2;
+	protected boolean r1;
+	protected boolean l1;
+	protected boolean r3;
+	protected boolean l3;
+	protected boolean buttonA;
+	protected boolean buttonB;
+	protected boolean buttonX;
+	protected boolean buttonY;
+	protected boolean buttonStart;
+	protected boolean buttonSelect;
+	protected boolean padUp;
+	protected boolean padDown;
+	protected boolean padLeft;
+	protected boolean padRight;
 	protected int ctrlTicksSinceUpdate = 0;
 
 	private final InterpolationHandler interpolator = new InterpolationHandler(this, 3);
@@ -1695,41 +1753,37 @@ public abstract class AbstractRCEntity extends Entity
 	 * Subclasses that implement real analog handling should call this,
 	 * NOT the fallback mapping.
 	 */
-	protected final void storeAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	protected final void storeAnalogInput(float lx, float ly, float rx, float ry, float l2, float r2, boolean r1, boolean l1, boolean r3, boolean l3, boolean buttonA, boolean buttonB, boolean buttonX, boolean buttonY, boolean buttonStart, boolean buttonSelect, boolean padUp, boolean padDown, boolean padLeft, boolean padRight)
 	{
-		this.ctrlPitch = clamp11(pitch);
-		this.ctrlRoll = clamp11(roll);
-		this.ctrlYaw = clamp11(yaw);
-		this.ctrlThrottle = clamp11(throttle);
-		this.ctrlBrake = brake;
-		this.ctrlTicksSinceUpdate = 0;
+		this.lx = lx;
+		this.ly = ly;
+		this.rx = rx;
+		this.ry = ry;
+		this.l2 = l2;
+		this.r2 = r2;
+		this.r1 = r1;
+		this.l1 = l1;
+		this.r3 = r3;
+		this.l3 = l3;
+		this.buttonA = buttonA;
+		this.buttonB = buttonB;
+		this.buttonX = buttonX;
+		this.buttonY = buttonY;
+		this.buttonStart = buttonStart;
+		this.buttonSelect = buttonSelect;
+		this.padUp = padUp;
+		this.padDown = padDown;
+		this.padLeft = padLeft;
+		this.padRight = padRight;
 	}
 
 	/**
 	 * Analog control entrypoint (default behavior):
 	 * Store state, then convert analog -> legacy 6 booleans and call remoteControlInput(...).
 	 */
-	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	public void remoteControlAnalogInput(float lx, float ly, float rx, float ry, float l2, float r2, boolean r1, boolean l1, boolean r3, boolean l3, boolean buttonA, boolean buttonB, boolean buttonX, boolean buttonY, boolean buttonStart, boolean buttonSelect, boolean padUp, boolean padDown, boolean padLeft, boolean padRight)
 	{
-		storeAnalogInput(pitch, roll, yaw, throttle, brake);
-
-		boolean[] input = new boolean[6];
-
-		// NOTE: This mapping is "generic legacy" and may not match PlaneEntity's meaning.
-		input[0] = this.ctrlPitch > 0.25f;   // up
-		input[1] = this.ctrlPitch < -0.25f;  // down
-		input[2] = this.ctrlRoll < -0.25f;   // left
-		input[3] = this.ctrlRoll > 0.25f;    // right
-		input[4] = this.ctrlThrottle > 0.25f;   // jump
-		input[5] = this.ctrlThrottle < -0.25f;  // shift
-
-		remoteControlInput(input);
-	}
-
-	protected static float clamp11(float v) {
-		if (v < -1.0f) return -1.0f;
-		if (v > 1.0f) return 1.0f;
-		return v;
+		storeAnalogInput(lx, ly, rx, ry, l2, r2, r1, l1, r3, l3, buttonA, buttonB, buttonX, buttonY, buttonStart, buttonSelect, padUp, padDown, padLeft, padRight);
 	}
 
 	public abstract Item asItem();
@@ -1930,11 +1984,26 @@ public abstract class AbstractRCEntity extends Entity
 				if(entity instanceof AbstractRCEntity rc && rc.isEnabled())
 				{
 					rc.remoteControlAnalogInput(
-							payload.pitch(),
-							payload.roll(),
-							payload.yaw(),
-							payload.throttle(),
-							payload.brake()
+					payload.lx(),
+					payload.ly(),
+					payload.rx(),
+					payload.ry(),
+					payload.l2(),
+					payload.r2(),
+					payload.r1(),
+					payload.l1(),
+					payload.r3(),
+					payload.l3(),
+					payload.buttonA(),
+					payload.buttonB(),
+					payload.buttonX(),
+					payload.buttonY(),
+					payload.buttonStart(),
+					payload.buttonSelect(),
+					payload.padUp(),
+					payload.padDown(),
+					payload.padLeft(),
+					payload.padRight()
 					);
 				}
 			}
@@ -2000,20 +2069,26 @@ import rctoys.RCToysMod;
 
 public class CarEntity extends AbstractRCEntity
 {
+	// Legacy digital controls: -1/0/+1
 	private int throttle;
 	private int steering;
-	
+	private boolean boost;
+
+	// Analog controls: -1..1 (throttle/steering)
+	private float throttleAnalog;
+	private float steeringAnalog;
+
 	public CarEntity(EntityType<?> entityType, Level world)
 	{
 		super(entityType, world);
 	}
-	
+
 	@Override
 	public Item asItem()
 	{
 		return RCToysMod.CAR_ITEM;
 	}
-	
+
 	@Override
 	public int getDefaultColor()
 	{
@@ -2027,52 +2102,79 @@ public class CarEntity extends AbstractRCEntity
 		{
 			throttle = 0;
 			steering = 0;
+			boost = false;
+
+			throttleAnalog = 0.0f;
+			steeringAnalog = 0.0f;
 		}
-		
+
+		// If analog hasn't been updated recently, decay it to zero so you don't get "stuck"
+		if (this.ctrlTicksSinceUpdate > 50)
+		{
+			throttleAnalog *= 0.85f;
+			steeringAnalog *= 0.85f;
+
+			if (Math.abs(throttleAnalog) < 0.001f) throttleAnalog = 0.0f;
+			if (Math.abs(steeringAnalog) < 0.001f) steeringAnalog = 0.0f;
+		}
+
+		float throttleInput  = Mth.clamp((float)throttle + throttleAnalog, -1.0f, 1.0f);
+		float steeringInput  = Mth.clamp((float)steering + steeringAnalog, -1.0f, 1.0f);
+		float boostFactor    = boost ? 2.0f : 1.0f;
+
+		// Keep whatever HUD/logic uses setThrottle in sync with combined input
+		setThrottle(throttleInput * boostFactor);
+
 		if(onGround())
 		{
-			setDeltaMovement(getDeltaMovement().scale(throttle == 0 ? 0.9 : 0.99));
-            Vector3f velocity = getDeltaMovement().toVector3f();
-            Vector3f horizontalVelocity = new Vector3f(velocity.x(), 0.0f, velocity.z());
-            Vector3f forward = new Vector3f(0.0f, 0.0f, -1.0f).rotateY(getYRot() * -Mth.DEG_TO_RAD + Mth.PI);
+			// Drag: stronger when you’re not actively throttling
+			boolean idle = Math.abs(throttleInput) < 0.01f;
+			setDeltaMovement(getDeltaMovement().scale(idle ? 0.9 : 0.99));
+
+			Vector3f velocity = getDeltaMovement().toVector3f();
+			Vector3f horizontalVelocity = new Vector3f(velocity.x(), 0.0f, velocity.z());
+
+			Vector3f forward = new Vector3f(0.0f, 0.0f, -1.0f)
+					.rotateY(getYRot() * -Mth.DEG_TO_RAD + Mth.PI);
+
 			float forwardMagnitude = horizontalVelocity.dot(forward);
-            Vector3f forwardVelocity = new Vector3f(forward).mul(forwardMagnitude);
-            Vector3f lateralVelocity = new Vector3f(horizontalVelocity).sub(forwardVelocity);
-			
-			// Forward Acceleration
-			float acc = throttle * 0.02f;
+			Vector3f forwardVelocity = new Vector3f(forward).mul(forwardMagnitude);
+			Vector3f lateralVelocity = new Vector3f(horizontalVelocity).sub(forwardVelocity);
+
+			// Forward Acceleration (analog-friendly)
+			float acc = throttleInput * 0.02f * boostFactor;
 			forwardVelocity.add(new Vector3f(forward).mul(acc));
-			
+
 			// Lateral Friction
 			float lateralFriction = 0.6f;
 			lateralVelocity.mul(lateralFriction);
-			
+
 			// New Velocity
-            Vector3f newVelocity = new Vector3f(forwardVelocity).add(lateralVelocity);
+			Vector3f newVelocity = new Vector3f(forwardVelocity).add(lateralVelocity);
 			setDeltaMovement(newVelocity.x(), velocity.y(), newVelocity.z());
-			
-			// Steering
-		    float turnSpeed = -12.0f / (1.0f + forwardMagnitude * 2.0f);
-		    setYRot(getYRot() + steering * turnSpeed);
+
+			// Steering (analog-friendly)
+			float turnSpeed = -12.0f / (1.0f + forwardMagnitude * 2.0f);
+			setYRot(getYRot() + steeringInput * turnSpeed);
 		}
 		else
 		{
 			// Pitch with vertical velocity.
-		    setXRot((float) (-getDeltaMovement().y() * 100.0));
-		    
-		    // Apply Gravity
+			setXRot((float) (-getDeltaMovement().y() * 100.0));
+
+			// Apply Gravity
 			applyGravity();
 		}
-		
+
 		// Extra drag in water.
 		if(isInWater())
 			setDeltaMovement(getDeltaMovement().multiply(0.8f, 0.5f, 0.8f));
-		
+
 		// Move and Jump
 		double previousY = getY();
 		move(MoverType.SELF, getDeltaMovement());
 		double deltaY = getY() - previousY;
-		
+
 		if(deltaY > 0.1 && verticalCollision)
 		{
 			double speed = Math.hypot(getDeltaMovement().x(), getDeltaMovement().z());
@@ -2080,7 +2182,7 @@ public class CarEntity extends AbstractRCEntity
 			push(0.0, jump, 0.0);
 		}
 	}
-	
+
 	@Override
 	public Quaternionf updateQuaternion()
 	{
@@ -2095,30 +2197,53 @@ public class CarEntity extends AbstractRCEntity
 	{
 		throttle = 0;
 		steering = 0;
-		
+		boost = false;
+
 		// Accelerate Forwards
 		if(inputArray[0])
 			throttle++;
-		
+
 		// Accelerate Backwards
 		if(inputArray[1])
 			throttle--;
-		
+
 		// Turn Left
 		if(inputArray[2])
 			steering++;
-		
+
 		// Turn Right
 		if(inputArray[3])
 			steering--;
-		
+
 		// Boost
 		if(inputArray[4])
-			throttle *= 2;
-		
-		setThrottle(throttle);
+			boost = true;
+
+		// Keep throttle display roughly consistent with what tickPhysics uses
+		setThrottle((float)throttle * (boost ? 2.0f : 1.0f));
 	}
-	
+
+	@Override
+	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	{
+		// IMPORTANT: do NOT call super.remoteControlAnalogInput(...) here,
+		// because it converts analog -> legacy booleans and calls remoteControlInput(),
+		// which fights our real analog controls.
+		storeAnalogInput(lx, ly, rx, ry, l2, r2, r1, l1, r3, l3, buttonA, buttonB, buttonX, buttonY, buttonStart, buttonSelect, padUp, padDown, padLeft, padRight);
+
+		// Throttle: prefer dedicated throttle axis, fall back to pitch if that’s how it’s mapped
+		float t = -ly;
+
+		// Steering: prefer yaw axis, fall back to roll if that’s how it’s mapped
+		float s = -rx;
+
+		this.throttleAnalog = Mth.clamp(t, -1.0f, 1.0f);
+		this.steeringAnalog = Mth.clamp(s, -1.0f, 1.0f);
+
+		// Optional: treat brake as “no boost” (and you can expand this later if you want actual braking)
+		// For now we leave boost purely on the digital boost button.
+	}
+
 	@Override
 	public boolean canSpawnSprintParticle()
 	{
@@ -2254,6 +2379,7 @@ public class PlaneEntity extends AbstractRCEntity
 		float rollInput = (float)roll + rollAnalog;
 		float throttleDelta = (float)throttleControl + throttleControlAnalog;
 
+		/* Debug Info for Controller Input
 		String msg = String.format(
 			"digital P%.2f R%.2f T%.2f | analog P%.2f R%.2f T%.2f | combined P%.2f R%.2f T%.2f",
 			(float)pitch, (float)roll, (float)throttleControl,
@@ -2270,6 +2396,7 @@ public class PlaneEntity extends AbstractRCEntity
 		        }
 		    }
 		}
+		*/
 
 		pitchInput = Mth.clamp(pitchInput, -1.0f, 1.0f);
 		rollInput = Mth.clamp(rollInput, -1.0f, 1.0f);
@@ -2387,16 +2514,16 @@ public class PlaneEntity extends AbstractRCEntity
 	}
 
 	@Override
-	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	public void remoteControlAnalogInput(float lx, float ly, float rx, float ry, float l2, float r2, boolean r1, boolean l1, boolean r3, boolean l3, boolean buttonA, boolean buttonB, boolean buttonX, boolean buttonY, boolean buttonStart, boolean buttonSelect, boolean padUp, boolean padDown, boolean padLeft, boolean padRight)
 	{
 		// IMPORTANT: do NOT call super.remoteControlAnalogInput(...) here,
 		// because it converts analog -> legacy booleans and calls remoteControlInput(),
 		// which fights our real analog controls.
-		storeAnalogInput(pitch, roll, yaw, throttle, brake);
+		storeAnalogInput(lx, ly, rx, ry, l2, r2, r1, l1, r3, l3, buttonA, buttonB, buttonX, buttonY, buttonStart, buttonSelect, padUp, padDown, padLeft, padRight);
 
-		this.pitchAnalog = Mth.clamp(pitch, -1.0f, 1.0f);
-		this.rollAnalog = Mth.clamp(roll, -1.0f, 1.0f);
-		this.throttleControlAnalog = Mth.clamp(throttle, -1.0f, 1.0f);
+		this.pitchAnalog = Mth.clamp(ly, -1.0f, 1.0f);
+		this.rollAnalog = Mth.clamp(lx, -1.0f, 1.0f);
+		this.throttleControlAnalog = Mth.clamp(ry, -1.0f, 1.0f);
 	}
 
 	@Override
@@ -2731,11 +2858,26 @@ import rctoys.RCToysMod;
  *  brake:    boolean
  */
 public record RemoteControlAnalogC2SPacket(
-        float pitch,
-        float roll,
-        float yaw,
-        float throttle,
-        boolean brake
+	float lx,
+	float ly,
+	float rx,
+	float ry,
+	float l2,
+	float r2,
+	boolean r1,
+	boolean l1,
+	boolean r3,
+	boolean l3,
+	boolean buttonA,
+	boolean buttonB,
+	boolean buttonX,
+	boolean buttonY,
+	boolean buttonStart,
+	boolean buttonSelect,
+	boolean padUp,
+	boolean padDown,
+	boolean padLeft,
+	boolean padRight
 ) implements CustomPacketPayload {
 
     public static final CustomPacketPayload.Type<RemoteControlAnalogC2SPacket> ID =
@@ -2743,11 +2885,26 @@ public record RemoteControlAnalogC2SPacket(
 
     public static final StreamCodec<RegistryFriendlyByteBuf, RemoteControlAnalogC2SPacket> CODEC =
             StreamCodec.composite(
-                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::pitch,
-                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::roll,
-                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::yaw,
-                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::throttle,
-                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::brake,
+                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::lx,
+                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::ly,
+                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::ry,
+                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::ry,
+                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::l2,
+                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::r2,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::r1,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::l1,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::r3,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::l3,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::buttonA,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::buttonB,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::buttonX,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::buttonY,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::buttonStart,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::buttonSelect,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::padUp,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::padDown,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::padLeft,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::padRight,
                     RemoteControlAnalogC2SPacket::new
             );
 
@@ -3002,7 +3159,10 @@ FILE: .\main\resources\assets\rctoys\lang\en_us.json
 	"key.rctoys.roll_right": "Roll Right",
 	"key.rctoys.brake": "Brake",
 	"key.rctoys.exit_control": "Exit RC Control",
-	"key.rctoys.toggle_camera": "Toggle RC Camera"
+	"key.rctoys.toggle_camera": "Toggle RC Camera",
+	"key.rctoys.toggle_fpv": "Toggle FPV",
+    "key.rctoys.toggle_face_vehicle": "Toggle Face Vehicle",
+    "key.rctoys.toggle_rear_camera": "Toggle Rear Camera (FPV+F5)"
 }
 -------------------------------------------
 FILE: .\main\resources\assets\rctoys\models\item\aero_surface.json
