@@ -104,32 +104,11 @@ public class RCToysModClient implements ClientModInitializer
 					if (RCToyKeybinds.JUMP.isDown())    input |= (1 << BIT_JUMP);
 					if (RCToyKeybinds.SHIFT.isDown())   input |= (1 << BIT_SHIFT);
 
-					// Also allow digital from controller (dpad-ish fallback)
-					ControllerSupport.DigitalPad pad = ControllerSupport.readDigital();
-					if (pad.forward) input |= (1 << BIT_UP);
-					if (pad.back)    input |= (1 << BIT_DOWN);
-					if (pad.left)    input |= (1 << BIT_LEFT);
-					if (pad.right)   input |= (1 << BIT_RIGHT);
-					if (pad.jump)    input |= (1 << BIT_JUMP);
-					if (pad.shift)   input |= (1 << BIT_SHIFT);
-
-					// Block vanilla movement while holding remote
-					client.options.keyUp.setDown(false);
-					client.options.keyDown.setDown(false);
-					client.options.keyLeft.setDown(false);
-					client.options.keyRight.setDown(false);
-					client.options.keyJump.setDown(false);
-					client.options.keyShift.setDown(false);
-
-					if(lastInput != input) {
-						ClientPlayNetworking.send(new RemoteControlC2SPacket(input));
-						lastInput = input;
-					}
-
 					// --- analog controller input ---
 					// We send analog if a controller is present AND there's meaningful analog movement,
 					// OR if we sent analog previously (to keep updates flowing while you hold an input).
 					ControllerSupport.AnalogState a = ControllerSupport.readAnalog();
+					boolean controllerAnalogPresent = a.present;
 					if (a.present) {
 						AnalogSnapshot snap = AnalogSnapshot.from(a);
 
@@ -143,6 +122,19 @@ public class RCToysModClient implements ClientModInitializer
 							));
 							lastAnalog = snap;
 						}
+					}
+
+					// Block vanilla movement while holding remote
+					client.options.keyUp.setDown(false);
+					client.options.keyDown.setDown(false);
+					client.options.keyLeft.setDown(false);
+					client.options.keyRight.setDown(false);
+					client.options.keyJump.setDown(false);
+					client.options.keyShift.setDown(false);
+
+					if(lastInput != input) {
+						ClientPlayNetworking.send(new RemoteControlC2SPacket(input));
+						lastInput = input;
 					}
 
 					// Toggle FPV (rebindable)
@@ -512,8 +504,8 @@ public final class ControllerSupport {
 	public static int AXIS_YAW = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_X;
 
 	// Inversion toggles
-	public static boolean INVERT_PITCH = true;  // many people prefer stick up = pitch up
-	public static boolean INVERT_ROLL = false;
+	public static boolean INVERT_PITCH = false;  // many people prefer stick up = pitch up
+	public static boolean INVERT_ROLL = true;
 	public static boolean INVERT_THROTTLE = true; // stick up usually negative
 
 	// Buttons
@@ -524,33 +516,6 @@ public final class ControllerSupport {
 	private static final GLFWGamepadState STATE = GLFWGamepadState.create();
 
 	private ControllerSupport() {}
-
-	public static DigitalPad readDigital() {
-		DigitalPad out = new DigitalPad();
-
-		AnalogState a = readAnalog();
-		if (!a.present) return out;
-
-		float THRESH = 0.10f; // MUCH more forgiving, avoids “only diagonals”
-
-		// Plane: your packet mapping is:
-		// [0]=pitch down, [1]=pitch up, [2]=roll left, [3]=roll right, [4]=throttle up, [5]=throttle down
-		out.left  = a.roll < -THRESH;  // roll left
-		out.right = a.roll >  THRESH;  // roll right
-
-		// pitch: + = pitch up (because you invert pitch), - = pitch down
-		out.forward = a.pitch >  THRESH;  // we’ll interpret "forward" as pitch up in client code
-		out.back    = a.pitch < -THRESH;  // pitch down
-
-		// and optionally use throttle axis too (if you're using it):
-		out.jump  = a.throttle >  THRESH; // treat as throttle up
-		out.shift = a.throttle < -THRESH; // treat as throttle down
-
-		out.jump = a.jump;
-		out.shift = a.shift;
-
-		return out;
-	}
 
 	public static AnalogState readAnalog() {
 		AnalogState out = new AnalogState();
@@ -598,11 +563,6 @@ public final class ControllerSupport {
 		return v;
 	}
 
-	public static final class DigitalPad {
-		public boolean forward, back, left, right;
-		public boolean jump, shift;
-	}
-
 	public static final class AnalogState {
 		public boolean present = false;
 		public float pitch = 0.0f;    // -1..1
@@ -614,6 +574,65 @@ public final class ControllerSupport {
 		// optional digital buttons (if you want them)
 		public boolean jump = false;
 		public boolean shift = false;
+	}
+
+	public static final class AnalogDebugState {
+	    public boolean present = false;
+	
+	    // raw values straight from GLFW state (no invert, no deadzone)
+	    public float rawPitch, rawRoll, rawYaw, rawThrottle;
+	
+	    // processed values (invert + deadzone + rescale)
+	    public float pitch, roll, yaw, throttle;
+	
+	    public boolean brake, jump, shift;
+	
+	    // extra info
+	    public boolean isGamepad = false;
+	    public int jid = GLFW.GLFW_JOYSTICK_1;
+	}
+	
+	public static AnalogDebugState readAnalogDebug() {
+	    AnalogDebugState out = new AnalogDebugState();
+	    out.jid = JOYSTICK_ID;
+	
+	    if (!ENABLED) return out;
+	    if (!GLFW.glfwJoystickPresent(JOYSTICK_ID)) return out;
+	
+	    out.isGamepad = GLFW.glfwJoystickIsGamepad(JOYSTICK_ID);
+	    if (!out.isGamepad) return out;
+	
+	    if (!GLFW.glfwGetGamepadState(JOYSTICK_ID, STATE)) return out;
+	
+	    out.present = true;
+	
+	    // raw
+	    float roll = STATE.axes(AXIS_ROLL);
+	    float pitch = STATE.axes(AXIS_PITCH);
+	    float throttle = STATE.axes(AXIS_THROTTLE);
+	    float yaw = STATE.axes(AXIS_YAW);
+	
+	    out.rawRoll = roll;
+	    out.rawPitch = pitch;
+	    out.rawThrottle = throttle;
+	    out.rawYaw = yaw;
+	
+	    // apply invert
+	    if (INVERT_ROLL) roll = -roll;
+	    if (INVERT_PITCH) pitch = -pitch;
+	    if (INVERT_THROTTLE) throttle = -throttle;
+	
+	    // processed
+	    out.roll = applyDeadzone(roll);
+	    out.pitch = applyDeadzone(pitch);
+	    out.throttle = applyDeadzone(throttle);
+	    out.yaw = applyDeadzone(yaw);
+	
+	    out.brake = STATE.buttons(BUTTON_BRAKE) == GLFW.GLFW_PRESS;
+	    out.jump  = STATE.buttons(BUTTON_JUMP) == GLFW.GLFW_PRESS;
+	    out.shift = STATE.buttons(BUTTON_SHIFT) == GLFW.GLFW_PRESS;
+	
+	    return out;
 	}
 }
 -------------------------------------------
@@ -1530,8 +1549,6 @@ public abstract class AbstractRCEntity extends Entity
 	private static final EntityDataAccessor<Float> THROTTLE = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.FLOAT);
 
 	// --- Analog control state (server-side) ---
-	// These are optional: by default we convert analog -> legacy 6 booleans and call remoteControlInput(...)
-	// Once you update PlaneEntity, you can override remoteControlAnalogInput(...) and use these values directly.
 	protected float ctrlPitch;     // -1..1
 	protected float ctrlRoll;      // -1..1
 	protected float ctrlYaw;       // -1..1
@@ -1651,7 +1668,6 @@ public abstract class AbstractRCEntity extends Entity
 		}
 		else
 		{
-			// basic “stale input” tracking (optional safety)
 			if (this.ctrlTicksSinceUpdate < 1_000_000) this.ctrlTicksSinceUpdate++;
 
 			tickPhysics();
@@ -1675,44 +1691,42 @@ public abstract class AbstractRCEntity extends Entity
 	public abstract void remoteControlInput(boolean[] inputArray);
 
 	/**
-	 * Analog control entrypoint (new).
-	 *
-	 * Default behavior (for now):
-	 *   Convert analog to the existing 6 booleans and call remoteControlInput(...)
-	 *
-	 * When you update PlaneEntity for real granular pitch/roll,
-	 * override this method in PlaneEntity and use pitch/roll/yaw/throttle directly.
+	 * Store analog state + reset stale timer.
+	 * Subclasses that implement real analog handling should call this,
+	 * NOT the fallback mapping.
 	 */
-	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	protected final void storeAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
 	{
-		// Store state (useful once PlaneEntity overrides and uses it)
 		this.ctrlPitch = clamp11(pitch);
 		this.ctrlRoll = clamp11(roll);
 		this.ctrlYaw = clamp11(yaw);
 		this.ctrlThrottle = clamp11(throttle);
 		this.ctrlBrake = brake;
 		this.ctrlTicksSinceUpdate = 0;
+	}
 
-		// Fallback mapping -> legacy 6 buttons.
-		// This is a *best effort* mapping without PlaneEntity code:
-		// - pitch controls forward/back
-		// - roll controls left/right
-		// - throttle controls jump/shift (up/down)
+	/**
+	 * Analog control entrypoint (default behavior):
+	 * Store state, then convert analog -> legacy 6 booleans and call remoteControlInput(...).
+	 */
+	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	{
+		storeAnalogInput(pitch, roll, yaw, throttle, brake);
+
 		boolean[] input = new boolean[6];
 
+		// NOTE: This mapping is "generic legacy" and may not match PlaneEntity's meaning.
 		input[0] = this.ctrlPitch > 0.25f;   // up
 		input[1] = this.ctrlPitch < -0.25f;  // down
 		input[2] = this.ctrlRoll < -0.25f;   // left
 		input[3] = this.ctrlRoll > 0.25f;    // right
-
-		// treat throttle as vertical “up/down”:
 		input[4] = this.ctrlThrottle > 0.25f;   // jump
 		input[5] = this.ctrlThrottle < -0.25f;  // shift
 
 		remoteControlInput(input);
 	}
 
-	private static float clamp11(float v) {
+	protected static float clamp11(float v) {
 		if (v < -1.0f) return -1.0f;
 		if (v > 1.0f) return 1.0f;
 		return v;
@@ -1756,7 +1770,6 @@ public abstract class AbstractRCEntity extends Entity
 
 		if(!stack.is(RCToysMod.REMOTE))
 		{
-			// Miniature players can ride RC toys :)
 			if(player.getScale() <= 0.31)
 			{
 				player.startRiding(this);
@@ -1958,12 +1971,10 @@ public abstract class AbstractRCEntity extends Entity
 					}
 				}
 				else {
-					// Reset the tracking player's client chunk view and clear the reference.
 					if(rcEntity.trackingPlayer != null) {
 						rcEntity.trackingPlayer.setChunkTrackingView(ChunkTrackingView.EMPTY);
 						rcEntity.trackingPlayer = null;
 					}
-					// Discard the chunk loading fake player.
 					if(rcEntity.fakePlayer != null) {
 						serverLevel.removePlayerImmediately(rcEntity.fakePlayer, RemovalReason.DISCARDED);
 						rcEntity.fakePlayer = null;
@@ -2161,6 +2172,9 @@ import net.minecraft.world.level.Level;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 import rctoys.RCToysMod;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.MinecraftServer;
 
 public class PlaneEntity extends AbstractRCEntity
 {
@@ -2227,7 +2241,6 @@ public class PlaneEntity extends AbstractRCEntity
 		}
 
 		// If analog hasn't been updated recently, decay it to zero so you don't get "stuck"
-		// (ctrlTicksSinceUpdate is incremented server-side in AbstractRCEntity.tick()).
 		if (this.ctrlTicksSinceUpdate > 50) {
 			pitchAnalog *= 0.85f;
 			rollAnalog *= 0.85f;
@@ -2237,17 +2250,31 @@ public class PlaneEntity extends AbstractRCEntity
 			if (Math.abs(throttleControlAnalog) < 0.001f) throttleControlAnalog = 0.0f;
 		}
 
-		// Combine digital + analog (digital acts like "add ±1")
 		float pitchInput = (float)pitch + pitchAnalog;
 		float rollInput = (float)roll + rollAnalog;
 		float throttleDelta = (float)throttleControl + throttleControlAnalog;
 
-		// Clamp combined inputs to sane ranges
+		String msg = String.format(
+			"digital P%.2f R%.2f T%.2f | analog P%.2f R%.2f T%.2f | combined P%.2f R%.2f T%.2f",
+			(float)pitch, (float)roll, (float)throttleControl,
+			pitchAnalog, rollAnalog, throttleControlAnalog,
+			pitchInput, rollInput, throttleDelta
+		);
+
+		if (!level().isClientSide()) {
+		    MinecraftServer server = level().getServer();
+		    if (server != null) {
+		        Component actionbar = Component.literal(msg);
+		        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+		            player.displayClientMessage(actionbar, true);
+		        }
+		    }
+		}
+
 		pitchInput = Mth.clamp(pitchInput, -1.0f, 1.0f);
 		rollInput = Mth.clamp(rollInput, -1.0f, 1.0f);
 		throttleDelta = Mth.clamp(throttleDelta, -1.0f, 1.0f);
 
-		// Smooth throttle like original, but now supports analog delta
 		throttle = Mth.clamp(throttle + throttleDelta * 0.1f, 0.0f, 1.0f);
 		setThrottle(throttle);
 
@@ -2291,14 +2318,11 @@ public class PlaneEntity extends AbstractRCEntity
 
 		push(acc.x(), acc.y(), acc.z());
 
-		// Apply Gravity
 		applyGravity();
 
-		// Extra Drag
 		if(isInWater() || (onGround() && throttle == 0.0f))
 			setDeltaMovement(getDeltaMovement().multiply(0.8f, 0.5f, 0.8f));
 
-		// Move
 		move(MoverType.SELF, getDeltaMovement());
 	}
 
@@ -2308,7 +2332,6 @@ public class PlaneEntity extends AbstractRCEntity
 		Quaternionf quaternion = getQuaternion();
 		Vector3f velocity = getDeltaMovement().toVector3f();
 
-		// Combine inputs exactly like physics did
 		float pitchInput = Mth.clamp((float)pitch + pitchAnalog, -1.0f, 1.0f);
 		float rollInput  = Mth.clamp((float)roll  + rollAnalog,  -1.0f, 1.0f);
 
@@ -2334,7 +2357,6 @@ public class PlaneEntity extends AbstractRCEntity
 	@Override
 	public void remoteControlInput(boolean[] inputArray)
 	{
-		// Digital legacy: reset each packet
 		pitch = 0;
 		roll = 0;
 		throttleControl = 0;
@@ -2367,20 +2389,14 @@ public class PlaneEntity extends AbstractRCEntity
 	@Override
 	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
 	{
-		// Store to base fields (and reset stale timer)
-		super.remoteControlAnalogInput(pitch, roll, yaw, throttle, brake);
+		// IMPORTANT: do NOT call super.remoteControlAnalogInput(...) here,
+		// because it converts analog -> legacy booleans and calls remoteControlInput(),
+		// which fights our real analog controls.
+		storeAnalogInput(pitch, roll, yaw, throttle, brake);
 
-		// For planes we use analog directly.
-		// Convention here:
-		//  pitch:   -1..1  (negative = pitch up or down depends on your controller mapping; adjust client-side invert)
-		//  roll:    -1..1
-		//  throttle:-1..1  where + increases throttle, - decreases throttle
 		this.pitchAnalog = Mth.clamp(pitch, -1.0f, 1.0f);
 		this.rollAnalog = Mth.clamp(roll, -1.0f, 1.0f);
 		this.throttleControlAnalog = Mth.clamp(throttle, -1.0f, 1.0f);
-
-		// Optional: you could use yaw/brake later (e.g., rudder or airbrake),
-		// but this physics model currently doesn't have a yaw input.
 	}
 
 	@Override

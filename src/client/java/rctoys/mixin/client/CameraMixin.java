@@ -9,7 +9,6 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import net.fabricmc.api.EnvType;
@@ -59,16 +58,37 @@ public abstract class CameraMixin
         if(RCToysModClient.fpvUUID != null && client.level != null) {
             Entity fpvEntity = client.level.getEntity(RCToysModClient.fpvUUID);
 
-            if(fpvEntity != null && fpvEntity instanceof AbstractRCEntity) {
-                if(bl) {
+            if(fpvEntity instanceof AbstractRCEntity rc) {
+
+                boolean useRearThirdPerson = bl && RCToysModClient.REAR_CAMERA_ENABLED;
+
+                if (useRearThirdPerson) {
+                    // Third-person FPV camera follows RC orientation and is tilted so it aims slightly above the vehicle.
+                    float partialTicks = client.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+
+                    Quaternionf q = rc.getLerpedQuaternion(partialTicks);
+
+                    // Apply pitch offset (degrees -> radians).
+                    float offRad = RCToysModClient.REAR_CAMERA_PITCH_OFFSET_DEG * Mth.DEG_TO_RAD;
+                    q = new Quaternionf(q).rotateX(offRad);
+
+                    this.rotation.set(q);
+                    FORWARDS.rotate(this.rotation, this.forwards);
+                    UP.rotate(this.rotation, this.up);
+                    LEFT.rotate(this.rotation, this.left);
+
+                    // Do NOT apply bl2 "front view" flip; rear cam is forced
+                } else if (bl) {
+                    // Normal third-person behavior based on the player view
                     this.setRotation(entity.getViewYRot(f), entity.getViewXRot(f));
 
                     if(bl2)
                         this.setRotation(this.yRot + 180.0f, -this.xRot);
                 } else {
-                    // Point the camera in the forward direction while in FPV mode.
+                    // First-person FPV mode: camera points forward with the RC quaternion
                     float partialTicks = client.getDeltaTracker().getGameTimeDeltaPartialTick(false);
-                    Quaternionf quaternion = ((AbstractRCEntity) fpvEntity).getLerpedQuaternion(partialTicks);
+                    Quaternionf quaternion = rc.getLerpedQuaternion(partialTicks);
+
                     this.rotation.set(quaternion);
                     FORWARDS.rotate(this.rotation, this.forwards);
                     UP.rotate(this.rotation, this.up);

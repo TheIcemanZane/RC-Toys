@@ -15,6 +15,10 @@ public final class ControllerConfig {
     /** Empty = auto-pick first connected. */
     public String selectedGuid = "";
 
+    /** New: per-axis inversion options. */
+    public boolean invertPitch = false;
+    public boolean invertRoll = true;
+
     public static ControllerConfig load() {
         Path file = filePath();
         if (Files.isRegularFile(file)) {

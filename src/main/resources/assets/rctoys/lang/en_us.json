@@ -28,5 +28,8 @@
 	"key.rctoys.roll_right": "Roll Right",
 	"key.rctoys.brake": "Brake",
 	"key.rctoys.exit_control": "Exit RC Control",
-	"key.rctoys.toggle_camera": "Toggle RC Camera"
+	"key.rctoys.toggle_camera": "Toggle RC Camera",
+	"key.rctoys.toggle_fpv": "Toggle FPV",
+    "key.rctoys.toggle_face_vehicle": "Toggle Face Vehicle",
+    "key.rctoys.toggle_rear_camera": "Toggle Rear Camera (FPV+F5)"
 }

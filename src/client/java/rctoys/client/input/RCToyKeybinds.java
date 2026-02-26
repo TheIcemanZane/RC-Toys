@@ -11,11 +11,9 @@ import rctoys.RCToysMod;
  * Rebindable RC controls that show up in Options -> Controls.
  */
 public final class RCToyKeybinds {
-    // Custom category (newer MC uses a Category object, not a String)
     public static final KeyMapping.Category CATEGORY =
         KeyMapping.Category.register(Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "controls"));
 
-    // Mirrors old behavior by default (WASD/Space/Shift) but now configurable.
     public static KeyMapping FORWARD;
     public static KeyMapping BACK;
     public static KeyMapping LEFT;
@@ -23,8 +21,11 @@ public final class RCToyKeybinds {
     public static KeyMapping JUMP;
     public static KeyMapping SHIFT;
 
-    // Replaces hardcoded V
     public static KeyMapping TOGGLE_FPV;
+
+    // NEW:
+    public static KeyMapping TOGGLE_FACE_VEHICLE;
+    public static KeyMapping TOGGLE_REAR_CAMERA;
 
     private RCToyKeybinds() {}
 
@@ -37,6 +38,10 @@ public final class RCToyKeybinds {
         SHIFT   = register("key.rctoys.shift",   GLFW.GLFW_KEY_LEFT_SHIFT);
 
         TOGGLE_FPV = register("key.rctoys.toggle_fpv", GLFW.GLFW_KEY_V);
+
+        // Defaults chosen to not conflict with common movement:
+        TOGGLE_FACE_VEHICLE = register("key.rctoys.toggle_face_vehicle", GLFW.GLFW_KEY_B);
+        TOGGLE_REAR_CAMERA  = register("key.rctoys.toggle_rear_camera",  GLFW.GLFW_KEY_N);
     }
 
     private static KeyMapping register(String translationKey, int defaultKey) {

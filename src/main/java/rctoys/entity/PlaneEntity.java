@@ -91,6 +91,7 @@ public class PlaneEntity extends AbstractRCEntity
 		float rollInput = (float)roll + rollAnalog;
 		float throttleDelta = (float)throttleControl + throttleControlAnalog;
 
+		/* Debug Info for Controller Input
 		String msg = String.format(
 			"digital P%.2f R%.2f T%.2f | analog P%.2f R%.2f T%.2f | combined P%.2f R%.2f T%.2f",
 			(float)pitch, (float)roll, (float)throttleControl,
@@ -107,6 +108,7 @@ public class PlaneEntity extends AbstractRCEntity
 		        }
 		    }
 		}
+		*/
 
 		pitchInput = Mth.clamp(pitchInput, -1.0f, 1.0f);
 		rollInput = Mth.clamp(rollInput, -1.0f, 1.0f);
