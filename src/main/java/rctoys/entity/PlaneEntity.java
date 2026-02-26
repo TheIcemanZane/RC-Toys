@@ -9,6 +9,9 @@ import net.minecraft.world.level.Level;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 import rctoys.RCToysMod;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.MinecraftServer;
 
 public class PlaneEntity extends AbstractRCEntity
 {
@@ -87,6 +90,23 @@ public class PlaneEntity extends AbstractRCEntity
 		float pitchInput = (float)pitch + pitchAnalog;
 		float rollInput = (float)roll + rollAnalog;
 		float throttleDelta = (float)throttleControl + throttleControlAnalog;
+
+		String msg = String.format(
+			"digital P%.2f R%.2f T%.2f | analog P%.2f R%.2f T%.2f | combined P%.2f R%.2f T%.2f",
+			(float)pitch, (float)roll, (float)throttleControl,
+			pitchAnalog, rollAnalog, throttleControlAnalog,
+			pitchInput, rollInput, throttleDelta
+		);
+
+		if (!level().isClientSide()) {
+		    MinecraftServer server = level().getServer();
+		    if (server != null) {
+		        Component actionbar = Component.literal(msg);
+		        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+		            player.displayClientMessage(actionbar, true);
+		        }
+		    }
+		}
 
 		pitchInput = Mth.clamp(pitchInput, -1.0f, 1.0f);
 		rollInput = Mth.clamp(rollInput, -1.0f, 1.0f);

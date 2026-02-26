@@ -119,23 +119,8 @@ public class RCToysModClient implements ClientModInitializer
 									snap.brake
 							));
 							lastAnalog = snap;
-							String msg = String.format(
-								"proc P%.2f R%.2f Y%.2f T%.2f | dz=%.2f",
-								snap.pitch, snap.roll, snap.yaw, snap.throttle,
-								ControllerSupport.DEADZONE
-							);
-							client.player.displayClientMessage(net.minecraft.network.chat.Component.literal(msg), true);
 						}
 					}
-
-					// Also allow digital from controller (dpad-ish fallback)
-					ControllerSupport.DigitalPad pad = ControllerSupport.readDigital();
-					if (pad.forward) input |= (1 << BIT_UP);
-					if (pad.back)    input |= (1 << BIT_DOWN);
-					if (pad.left)    input |= (1 << BIT_LEFT);
-					if (pad.right)   input |= (1 << BIT_RIGHT);
-					if (pad.jump)    input |= (1 << BIT_JUMP);
-					if (pad.shift)   input |= (1 << BIT_SHIFT);
 
 					// Block vanilla movement while holding remote
 					client.options.keyUp.setDown(false);

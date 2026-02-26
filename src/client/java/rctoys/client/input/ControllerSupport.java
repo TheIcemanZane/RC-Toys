@@ -29,8 +29,8 @@ public final class ControllerSupport {
 	public static int AXIS_YAW = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_X;
 
 	// Inversion toggles
-	public static boolean INVERT_PITCH = true;  // many people prefer stick up = pitch up
-	public static boolean INVERT_ROLL = false;
+	public static boolean INVERT_PITCH = false;  // many people prefer stick up = pitch up
+	public static boolean INVERT_ROLL = true;
 	public static boolean INVERT_THROTTLE = true; // stick up usually negative
 
 	// Buttons
@@ -41,33 +41,6 @@ public final class ControllerSupport {
 	private static final GLFWGamepadState STATE = GLFWGamepadState.create();
 
 	private ControllerSupport() {}
-
-	public static DigitalPad readDigital() {
-		DigitalPad out = new DigitalPad();
-
-		AnalogState a = readAnalog();
-		if (!a.present) return out;
-
-		float THRESH = 0.10f; // MUCH more forgiving, avoids “only diagonals”
-
-		// Plane: your packet mapping is:
-		// [0]=pitch down, [1]=pitch up, [2]=roll left, [3]=roll right, [4]=throttle up, [5]=throttle down
-		out.left  = a.roll < -THRESH;  // roll left
-		out.right = a.roll >  THRESH;  // roll right
-
-		// pitch: + = pitch up (because you invert pitch), - = pitch down
-		out.forward = a.pitch >  THRESH;  // we’ll interpret "forward" as pitch up in client code
-		out.back    = a.pitch < -THRESH;  // pitch down
-
-		// and optionally use throttle axis too (if you're using it):
-		out.jump  = a.throttle >  THRESH; // treat as throttle up
-		out.shift = a.throttle < -THRESH; // treat as throttle down
-
-		out.jump = a.jump;
-		out.shift = a.shift;
-
-		return out;
-	}
 
 	public static AnalogState readAnalog() {
 		AnalogState out = new AnalogState();
@@ -113,11 +86,6 @@ public final class ControllerSupport {
 		if (v < 0.0f) return 0.0f;
 		if (v > 1.0f) return 1.0f;
 		return v;
-	}
-
-	public static final class DigitalPad {
-		public boolean forward, back, left, right;
-		public boolean jump, shift;
 	}
 
 	public static final class AnalogState {
