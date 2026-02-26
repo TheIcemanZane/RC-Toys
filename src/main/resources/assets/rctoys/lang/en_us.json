@@ -16,5 +16,17 @@
 	"entity.rctoys.remote_linked": "Remote link established",
 	"sound.rctoys.remote_link": "Remote",
 	"sound.rctoys.car_loop": "RC Car",
-	"sound.rctoys.plane_loop": "RC Plane"
+	"sound.rctoys.plane_loop": "RC Plane",
+	"key.categories.rctoys": "RC Toys",
+	"key.rctoys.throttle_up": "Throttle Up",
+	"key.rctoys.throttle_down": "Throttle Down",
+	"key.rctoys.yaw_left": "Yaw Left",
+	"key.rctoys.yaw_right": "Yaw Right",
+	"key.rctoys.pitch_up": "Pitch Up",
+	"key.rctoys.pitch_down": "Pitch Down",
+	"key.rctoys.roll_left": "Roll Left",
+	"key.rctoys.roll_right": "Roll Right",
+	"key.rctoys.brake": "Brake",
+	"key.rctoys.exit_control": "Exit RC Control",
+	"key.rctoys.toggle_camera": "Toggle RC Camera"
 }

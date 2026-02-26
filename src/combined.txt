@@ -1,0 +1,3580 @@
+FILE: .\client\java\rctoys\client\RCToysModClient.java
+
+package rctoys.client;
+
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.item.v1.ItemTooltipCallback;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.fabricmc.fabric.api.client.rendering.v1.EntityModelLayerRegistry;
+import net.fabricmc.fabric.api.client.rendering.v1.EntityRendererRegistry;
+import net.minecraft.ChatFormatting;
+import net.minecraft.client.KeyMapping;
+import net.minecraft.client.model.geom.ModelLayerLocation;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.Entity;
+import rctoys.RCToysMod;
+import rctoys.client.input.ControllerSupport;
+import rctoys.client.input.GamepadMappings;
+import rctoys.client.input.RCToyKeybinds;
+import rctoys.client.command.RCToysClientCommands;
+import rctoys.client.render.entity.CarEntityRenderer;
+import rctoys.client.render.entity.PlaneEntityRenderer;
+import rctoys.client.render.entity.model.CarEntityModel;
+import rctoys.client.render.entity.model.PlaneEntityModel;
+import rctoys.client.sound.DynamicSoundManager;
+import rctoys.entity.AbstractRCEntity;
+import rctoys.item.RemoteLinkComponent;
+import rctoys.network.c2s.MotorSoundS2CPacket;
+import rctoys.network.c2s.RemoteControlAnalogC2SPacket;
+import rctoys.network.c2s.RemoteControlC2SPacket;
+import rctoys.network.c2s.TrackingPlayerC2SPacket;
+import org.lwjgl.glfw.GLFW;
+
+import java.util.UUID;
+
+
+public class RCToysModClient implements ClientModInitializer
+{
+	public static final ModelLayerLocation MODEL_CAR_LAYER = new ModelLayerLocation(Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "rc_car"), "main");
+	public static final ModelLayerLocation MODEL_PLANE_LAYER = new ModelLayerLocation(Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "rc_plane"), "main");
+
+	private static final int BIT_UP    = 0;
+	private static final int BIT_DOWN  = 1;
+	private static final int BIT_LEFT  = 2;
+	private static final int BIT_RIGHT = 3;
+	private static final int BIT_JUMP  = 4;
+	private static final int BIT_SHIFT = 5;
+
+	private static int lastInput = -1;
+	private static AnalogSnapshot lastAnalog = new AnalogSnapshot();
+	public static UUID fpvUUID;
+
+	private static boolean controllerInit = false;
+	private static rctoys.client.input.ControllerConfig controllerConfig;
+
+	@Override
+	public void onInitializeClient()
+	{
+		RCToysClientCommands.register();
+		RCToyKeybinds.register();
+
+		ClientPlayNetworking.registerGlobalReceiver(MotorSoundS2CPacket.ID, (payload, context) -> DynamicSoundManager.receiveSoundPacket(payload, context));
+		EntityRendererRegistry.register(RCToysMod.CAR, (context) -> new CarEntityRenderer(context));
+		EntityRendererRegistry.register(RCToysMod.PLANE, (context) -> new PlaneEntityRenderer(context));
+		EntityModelLayerRegistry.registerModelLayer(MODEL_CAR_LAYER, CarEntityModel::getTexturedModelData);
+		EntityModelLayerRegistry.registerModelLayer(MODEL_PLANE_LAYER, PlaneEntityModel::getTexturedModelData);
+
+		ItemTooltipCallback.EVENT.register((stack, world, ctx, lines) -> {
+			RemoteLinkComponent link = stack.get(RCToysMod.REMOTE_LINK);
+			if(link != null && !link.name().isEmpty())
+				lines.add(Component.translatable("Linked to %s", link.name()).withStyle(ChatFormatting.GRAY));
+		});
+
+		ClientTickEvents.START_CLIENT_TICK.register(client -> {
+			GamepadMappings.ensureLoadedOnce();
+			GamepadMappings.ensureConfigExists();
+
+			if (!controllerInit) {
+    		    controllerInit = true;
+    		    controllerConfig = rctoys.client.input.ControllerConfig.load();
+    		}
+		
+    		// resolve selection each tick (handles disconnect/reconnect)
+			var cfg = rctoys.client.input.ControllerConfig.load();
+			int jid = rctoys.client.input.ControllerManager.findJidByGuid(cfg.selectedGuid).orElseGet(() -> rctoys.client.input.ControllerManager.firstConnected().orElse(org.lwjgl.glfw.GLFW.GLFW_JOYSTICK_1));
+    		rctoys.client.input.ControllerSupport.JOYSTICK_ID = jid;
+
+			if(client.player != null && client.level != null && client.player.getMainHandItem().getComponents().has(RCToysMod.REMOTE_LINK))
+			{
+				UUID uuid = client.player.getMainHandItem().getComponents().get(RCToysMod.REMOTE_LINK).uuid();
+				Entity e = client.level.getEntity(uuid);
+
+				if(e instanceof AbstractRCEntity entity && entity.isEnabled())
+				{
+					KeyMapping.setAll();
+
+					// --- legacy digital input (keyboard keybinds) ---
+					int input = 0;
+					if (RCToyKeybinds.FORWARD.isDown()) input |= (1 << BIT_UP);
+					if (RCToyKeybinds.BACK.isDown())    input |= (1 << BIT_DOWN);
+					if (RCToyKeybinds.LEFT.isDown())    input |= (1 << BIT_LEFT);
+					if (RCToyKeybinds.RIGHT.isDown())   input |= (1 << BIT_RIGHT);
+					if (RCToyKeybinds.JUMP.isDown())    input |= (1 << BIT_JUMP);
+					if (RCToyKeybinds.SHIFT.isDown())   input |= (1 << BIT_SHIFT);
+
+					// Also allow digital from controller (dpad-ish fallback)
+					ControllerSupport.DigitalPad pad = ControllerSupport.readDigital();
+					if (pad.forward) input |= (1 << BIT_UP);
+					if (pad.back)    input |= (1 << BIT_DOWN);
+					if (pad.left)    input |= (1 << BIT_LEFT);
+					if (pad.right)   input |= (1 << BIT_RIGHT);
+					if (pad.jump)    input |= (1 << BIT_JUMP);
+					if (pad.shift)   input |= (1 << BIT_SHIFT);
+
+					// Block vanilla movement while holding remote
+					client.options.keyUp.setDown(false);
+					client.options.keyDown.setDown(false);
+					client.options.keyLeft.setDown(false);
+					client.options.keyRight.setDown(false);
+					client.options.keyJump.setDown(false);
+					client.options.keyShift.setDown(false);
+
+					if(lastInput != input) {
+						ClientPlayNetworking.send(new RemoteControlC2SPacket(input));
+						lastInput = input;
+					}
+
+					// --- analog controller input ---
+					// We send analog if a controller is present AND there's meaningful analog movement,
+					// OR if we sent analog previously (to keep updates flowing while you hold an input).
+					ControllerSupport.AnalogState a = ControllerSupport.readAnalog();
+					if (a.present) {
+						AnalogSnapshot snap = AnalogSnapshot.from(a);
+
+						if (snap.shouldSendComparedTo(lastAnalog)) {
+							ClientPlayNetworking.send(new RemoteControlAnalogC2SPacket(
+									snap.pitch,
+									snap.roll,
+									snap.yaw,
+									snap.throttle,
+									snap.brake
+							));
+							lastAnalog = snap;
+						}
+					}
+
+					// Toggle FPV (rebindable)
+					while (RCToyKeybinds.TOGGLE_FPV.consumeClick())
+					{
+						if(fpvUUID == null)
+							fpvUUID = uuid;
+						else
+							fpvUUID = null;
+
+						ClientPlayNetworking.send(new TrackingPlayerC2SPacket(entity.getId(), fpvUUID != null));
+					}
+
+					return;
+				}
+			}
+
+			// Stop tracking if no longer controlling
+			if(fpvUUID != null && client.level != null) {
+				Entity fpvEntity = client.level.getEntity(fpvUUID);
+				if (fpvEntity != null)
+					ClientPlayNetworking.send(new TrackingPlayerC2SPacket(fpvEntity.getId(), false));
+			}
+
+			lastInput = -1;
+			lastAnalog = new AnalogSnapshot(); // reset
+			fpvUUID = null;
+		});
+	}
+
+	/**
+	 * Small helper to rate-limit analog packets.
+	 */
+	private static final class AnalogSnapshot {
+		// Quantized values reduce packet spam
+		private static final float STEP = 1.0f / 64.0f; // ~0.0156
+		private static final float EPS_SEND = STEP * 0.5f;
+
+		public float pitch = 0.0f;
+		public float roll = 0.0f;
+		public float yaw = 0.0f;
+		public float throttle = 0.0f;
+		public boolean brake = false;
+
+		public static AnalogSnapshot from(ControllerSupport.AnalogState a) {
+			AnalogSnapshot s = new AnalogSnapshot();
+			s.pitch = quant(a.pitch);
+			s.roll = quant(a.roll);
+			s.yaw = quant(a.yaw);
+			s.throttle = quant(a.throttle);
+			s.brake = a.brake;
+			return s;
+		}
+
+		public boolean shouldSendComparedTo(AnalogSnapshot prev) {
+			// Only send if changed enough OR brake toggled
+			if (this.brake != prev.brake) return true;
+
+			return Math.abs(this.pitch - prev.pitch) > EPS_SEND
+				|| Math.abs(this.roll - prev.roll) > EPS_SEND
+				|| Math.abs(this.yaw - prev.yaw) > EPS_SEND
+				|| Math.abs(this.throttle - prev.throttle) > EPS_SEND;
+		}
+
+		private static float quant(float v) {
+			// clamp + snap to STEP
+			if (v < -1.0f) v = -1.0f;
+			if (v > 1.0f) v = 1.0f;
+			return Math.round(v / STEP) * STEP;
+		}
+	}
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\command\RCToysClientCommands.java
+
+package rctoys.client.command;
+
+import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import net.minecraft.ChatFormatting;
+import net.minecraft.network.chat.Component;
+import rctoys.client.input.ControllerConfig;
+import rctoys.client.input.ControllerManager;
+
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument;
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
+
+public final class RCToysClientCommands {
+    private RCToysClientCommands() {}
+
+    public static void register() {
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> register(dispatcher));
+    }
+
+    private static void register(CommandDispatcher<FabricClientCommandSource> dispatcher) {
+        dispatcher.register(literal("rctoys")
+                .then(literal("controller")
+                        .then(literal("list").executes(ctx -> {
+                            var src = ctx.getSource();
+                            var list = ControllerManager.listConnected();
+
+                            if (list.isEmpty()) {
+                                src.sendFeedback(Component.literal("[rctoys] No controllers detected.").withStyle(ChatFormatting.RED));
+                                return 0;
+                            }
+
+                            src.sendFeedback(Component.literal("[rctoys] Connected controllers:").withStyle(ChatFormatting.GOLD));
+                            for (var c : list) {
+                                src.sendFeedback(Component.literal(String.format(
+                                        "  jid=%d | %s | gamepad=%s | guid=%s",
+                                        c.jid(), c.name(), c.isGamepad(), c.guid()
+                                )));
+                            }
+                            return list.size();
+                        }))
+
+                        .then(literal("status").executes(ctx -> {
+                            var src = ctx.getSource();
+                            ControllerConfig cfg = ControllerConfig.load();
+
+                            if (cfg.selectedGuid == null || cfg.selectedGuid.isBlank()) {
+                                src.sendFeedback(Component.literal("[rctoys] Controller selection: AUTO (first connected).").withStyle(ChatFormatting.YELLOW));
+                                var first = ControllerManager.firstConnected();
+                                if (first.isPresent()) {
+                                    var info = ControllerManager.getByJid(first.get()).orElse(null);
+                                    if (info != null) {
+                                        src.sendFeedback(Component.literal(String.format(
+                                                "[rctoys] Current: jid=%d | %s | gamepad=%s | guid=%s",
+                                                info.jid(), info.name(), info.isGamepad(), info.guid()
+                                        )).withStyle(ChatFormatting.GRAY));
+                                    }
+                                }
+                                return 1;
+                            }
+
+                            var jid = ControllerManager.findJidByGuid(cfg.selectedGuid);
+                            if (jid.isPresent()) {
+                                var info = ControllerManager.getByJid(jid.get()).orElse(null);
+                                if (info != null) {
+                                    src.sendFeedback(Component.literal(String.format(
+                                            "[rctoys] Selected: jid=%d | %s | gamepad=%s | guid=%s",
+                                            info.jid(), info.name(), info.isGamepad(), info.guid()
+                                    )).withStyle(ChatFormatting.GREEN));
+                                    return 1;
+                                }
+                            }
+
+                            src.sendFeedback(Component.literal("[rctoys] Selected controller GUID not currently connected: " + cfg.selectedGuid)
+                                    .withStyle(ChatFormatting.RED));
+                            return 0;
+                        }))
+
+                        .then(literal("clear").executes(ctx -> {
+                            var src = ctx.getSource();
+                            ControllerConfig cfg = ControllerConfig.load();
+                            cfg.selectedGuid = "";
+                            cfg.save();
+                            src.sendFeedback(Component.literal("[rctoys] Cleared controller selection (AUTO mode).").withStyle(ChatFormatting.GREEN));
+                            return 1;
+                        }))
+
+                        .then(literal("select")
+                                .then(argument("jid", IntegerArgumentType.integer(1, 16))
+                                        .executes(ctx -> {
+                                            var src = ctx.getSource();
+                                            int jid = IntegerArgumentType.getInteger(ctx, "jid");
+
+                                            var infoOpt = ControllerManager.getByJid(jid);
+                                            if (infoOpt.isEmpty()) {
+                                                src.sendFeedback(Component.literal("[rctoys] No controller present at jid=" + jid)
+                                                        .withStyle(ChatFormatting.RED));
+                                                return 0;
+                                            }
+
+                                            var info = infoOpt.get();
+                                            ControllerConfig cfg = ControllerConfig.load();
+                                            cfg.selectedGuid = info.guid();
+                                            cfg.save();
+
+                                            src.sendFeedback(Component.literal(String.format(
+                                                    "[rctoys] Selected controller: jid=%d | %s | gamepad=%s",
+                                                    info.jid(), info.name(), info.isGamepad()
+                                            )).withStyle(ChatFormatting.GREEN));
+
+                                            if (!info.isGamepad()) {
+                                                src.sendFeedback(Component.literal(
+                                                        "[rctoys] Note: isGamepad=false. You may need SDL mappings or raw joystick fallback."
+                                                ).withStyle(ChatFormatting.YELLOW));
+                                            }
+
+                                            return 1;
+                                        })))
+                )
+        );
+    }
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\input\ControllerConfig.java
+
+package rctoys.client.input;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import net.minecraft.client.Minecraft;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public final class ControllerConfig {
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    private static final String FILE_NAME = "rctoys-controller.json";
+
+    /** Empty = auto-pick first connected. */
+    public String selectedGuid = "";
+
+    public static ControllerConfig load() {
+        Path file = filePath();
+        if (Files.isRegularFile(file)) {
+            try {
+                ControllerConfig cfg = GSON.fromJson(Files.readString(file), ControllerConfig.class);
+                return cfg == null ? new ControllerConfig() : cfg;
+            } catch (Exception ignored) {}
+        }
+        return new ControllerConfig();
+    }
+
+    public void save() {
+        Path file = filePath();
+        try {
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, GSON.toJson(this));
+        } catch (IOException e) {
+            System.err.println("[rctoys] Failed to save controller config: " + e);
+        }
+    }
+
+    private static Path filePath() {
+        Path gameDir = Minecraft.getInstance().gameDirectory.toPath();
+        return gameDir.resolve("config").resolve(FILE_NAME);
+    }
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\input\ControllerFinder.java
+
+package rctoys.client.input;
+
+import org.lwjgl.glfw.GLFW;
+
+public final class ControllerFinder {
+    private ControllerFinder() {}
+
+    public static int findByNameContains(String needleLower) {
+        for (int jid = GLFW.GLFW_JOYSTICK_1; jid <= GLFW.GLFW_JOYSTICK_16; jid++) {
+            if (!GLFW.glfwJoystickPresent(jid)) continue;
+            String name = GLFW.glfwGetJoystickName(jid);
+            if (name == null) continue;
+            if (name.toLowerCase().contains(needleLower)) return jid;
+        }
+        return -1;
+    }
+
+    public static int firstConnected() {
+        for (int jid = GLFW.GLFW_JOYSTICK_1; jid <= GLFW.GLFW_JOYSTICK_16; jid++) {
+            if (GLFW.glfwJoystickPresent(jid)) return jid;
+        }
+        return GLFW.GLFW_JOYSTICK_1;
+    }
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\input\ControllerManager.java
+
+package rctoys.client.input;
+
+import org.lwjgl.glfw.GLFW;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+public final class ControllerManager {
+    private ControllerManager() {}
+
+    public record ControllerInfo(int jid, String name, String guid, boolean isGamepad) {}
+
+    public static List<ControllerInfo> listConnected() {
+        List<ControllerInfo> out = new ArrayList<>();
+        for (int jid = GLFW.GLFW_JOYSTICK_1; jid <= GLFW.GLFW_JOYSTICK_16; jid++) {
+            if (!GLFW.glfwJoystickPresent(jid)) continue;
+            String name = GLFW.glfwGetJoystickName(jid);
+            String guid = GLFW.glfwGetJoystickGUID(jid);
+            boolean gamepad = GLFW.glfwJoystickIsGamepad(jid);
+            out.add(new ControllerInfo(
+                    jid,
+                    name == null ? ("Joystick " + jid) : name,
+                    guid == null ? "" : guid,
+                    gamepad
+            ));
+        }
+        return out;
+    }
+
+    public static Optional<ControllerInfo> getByJid(int jid) {
+        if (jid < GLFW.GLFW_JOYSTICK_1 || jid > GLFW.GLFW_JOYSTICK_16) return Optional.empty();
+        if (!GLFW.glfwJoystickPresent(jid)) return Optional.empty();
+        String name = GLFW.glfwGetJoystickName(jid);
+        String guid = GLFW.glfwGetJoystickGUID(jid);
+        boolean gamepad = GLFW.glfwJoystickIsGamepad(jid);
+        return Optional.of(new ControllerInfo(
+                jid,
+                name == null ? ("Joystick " + jid) : name,
+                guid == null ? "" : guid,
+                gamepad
+        ));
+    }
+
+    public static Optional<Integer> findJidByGuid(String guid) {
+        if (guid == null || guid.isBlank()) return Optional.empty();
+        for (int jid = GLFW.GLFW_JOYSTICK_1; jid <= GLFW.GLFW_JOYSTICK_16; jid++) {
+            if (!GLFW.glfwJoystickPresent(jid)) continue;
+            String g = GLFW.glfwGetJoystickGUID(jid);
+            if (guid.equals(g)) return Optional.of(jid);
+        }
+        return Optional.empty();
+    }
+
+    public static Optional<Integer> firstConnected() {
+        for (int jid = GLFW.GLFW_JOYSTICK_1; jid <= GLFW.GLFW_JOYSTICK_16; jid++) {
+            if (GLFW.glfwJoystickPresent(jid)) return Optional.of(jid);
+        }
+        return Optional.empty();
+    }
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\input\ControllerSupport.java
+
+package rctoys.client.input;
+
+import org.lwjgl.glfw.GLFW;
+import org.lwjgl.glfw.GLFWGamepadState;
+
+public final class ControllerSupport {
+
+	public static boolean ENABLED = true;
+
+	// Which controller to read (GLFW_JOYSTICK_1..16)
+	public static int JOYSTICK_ID = GLFW.GLFW_JOYSTICK_1;
+
+	// Deadzone for sticks (applied after inversion)
+	public static float DEADZONE = 0.12f;
+
+	// Axes (defaults: left stick for roll/pitch)
+	public static int AXIS_ROLL = GLFW.GLFW_GAMEPAD_AXIS_LEFT_X;   // left(-) / right(+)
+	public static int AXIS_PITCH = GLFW.GLFW_GAMEPAD_AXIS_LEFT_Y;  // up(-) / down(+)
+
+	// Throttle: choose ONE approach.
+	// Option A: right stick Y as throttle delta (simple, works everywhere)
+	public static int AXIS_THROTTLE = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_Y;
+
+	// Option B (later): triggers as absolute throttle (needs more logic), keep for future:
+	// public static int AXIS_TRIGGER_LEFT  = GLFW.GLFW_GAMEPAD_AXIS_LEFT_TRIGGER;
+	// public static int AXIS_TRIGGER_RIGHT = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER;
+
+	// Optional yaw (not used by plane physics yet, but packet supports it)
+	public static int AXIS_YAW = GLFW.GLFW_GAMEPAD_AXIS_RIGHT_X;
+
+	// Inversion toggles
+	public static boolean INVERT_PITCH = true;  // many people prefer stick up = pitch up
+	public static boolean INVERT_ROLL = false;
+	public static boolean INVERT_THROTTLE = true; // stick up usually negative
+
+	// Buttons
+	public static int BUTTON_BRAKE = GLFW.GLFW_GAMEPAD_BUTTON_LEFT_BUMPER; // arbitrary default
+	public static int BUTTON_JUMP  = GLFW.GLFW_GAMEPAD_BUTTON_A;
+	public static int BUTTON_SHIFT = GLFW.GLFW_GAMEPAD_BUTTON_B;
+
+	private static final GLFWGamepadState STATE = GLFWGamepadState.create();
+
+	private ControllerSupport() {}
+
+	public static DigitalPad readDigital() {
+		DigitalPad out = new DigitalPad();
+
+		AnalogState a = readAnalog();
+		if (!a.present) return out;
+
+		float THRESH = 0.10f; // MUCH more forgiving, avoids “only diagonals”
+
+		// Plane: your packet mapping is:
+		// [0]=pitch down, [1]=pitch up, [2]=roll left, [3]=roll right, [4]=throttle up, [5]=throttle down
+		out.left  = a.roll < -THRESH;  // roll left
+		out.right = a.roll >  THRESH;  // roll right
+
+		// pitch: + = pitch up (because you invert pitch), - = pitch down
+		out.forward = a.pitch >  THRESH;  // we’ll interpret "forward" as pitch up in client code
+		out.back    = a.pitch < -THRESH;  // pitch down
+
+		// and optionally use throttle axis too (if you're using it):
+		out.jump  = a.throttle >  THRESH; // treat as throttle up
+		out.shift = a.throttle < -THRESH; // treat as throttle down
+
+		out.jump = a.jump;
+		out.shift = a.shift;
+
+		return out;
+	}
+
+	public static AnalogState readAnalog() {
+		AnalogState out = new AnalogState();
+
+		if (!ENABLED) return out;
+		if (!GLFW.glfwJoystickPresent(JOYSTICK_ID)) return out;
+		if (!GLFW.glfwJoystickIsGamepad(JOYSTICK_ID)) return out;
+		if (!GLFW.glfwGetGamepadState(JOYSTICK_ID, STATE)) return out;
+
+		out.present = true;
+
+		float roll = STATE.axes(AXIS_ROLL);
+		float pitch = STATE.axes(AXIS_PITCH);
+		float throttle = STATE.axes(AXIS_THROTTLE);
+		float yaw = STATE.axes(AXIS_YAW);
+
+		if (INVERT_ROLL) roll = -roll;
+		if (INVERT_PITCH) pitch = -pitch;
+		if (INVERT_THROTTLE) throttle = -throttle;
+
+		out.roll = applyDeadzone(roll);
+		out.pitch = applyDeadzone(pitch);
+		out.throttle = applyDeadzone(throttle);
+		out.yaw = applyDeadzone(yaw);
+
+		out.brake = STATE.buttons(BUTTON_BRAKE) == GLFW.GLFW_PRESS;
+		out.jump  = STATE.buttons(BUTTON_JUMP) == GLFW.GLFW_PRESS;
+		out.shift = STATE.buttons(BUTTON_SHIFT) == GLFW.GLFW_PRESS;
+
+		return out;
+	}
+
+	private static float applyDeadzone(float v) {
+		if (Math.abs(v) < DEADZONE) return 0.0f;
+
+		// Optional rescale so it smoothly starts after deadzone
+		float sign = Math.signum(v);
+		float mag = (Math.abs(v) - DEADZONE) / (1.0f - DEADZONE);
+		return sign * clamp01(mag);
+	}
+
+	private static float clamp01(float v) {
+		if (v < 0.0f) return 0.0f;
+		if (v > 1.0f) return 1.0f;
+		return v;
+	}
+
+	public static final class DigitalPad {
+		public boolean forward, back, left, right;
+		public boolean jump, shift;
+	}
+
+	public static final class AnalogState {
+		public boolean present = false;
+		public float pitch = 0.0f;    // -1..1
+		public float roll = 0.0f;     // -1..1
+		public float yaw = 0.0f;      // -1..1
+		public float throttle = 0.0f; // -1..1 (delta)
+		public boolean brake = false;
+
+		// optional digital buttons (if you want them)
+		public boolean jump = false;
+		public boolean shift = false;
+	}
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\input\GamepadMappings.java
+
+package rctoys.client.input;
+
+import net.minecraft.client.Minecraft;
+import org.lwjgl.glfw.GLFW;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.system.MemoryUtil;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static org.lwjgl.BufferUtils.createByteBuffer;
+
+public final class GamepadMappings {
+    private static boolean loaded = false;
+    private static boolean initialized = false;
+
+    private GamepadMappings() {}
+
+    /** Call this from a client tick AFTER the window exists. */
+    public static void ensureLoadedOnce() {
+        if (loaded) return;
+
+        // Window exists => GLFW should be initialized.
+        if (Minecraft.getInstance() == null || Minecraft.getInstance().getWindow() == null) return;
+
+        loaded = true;
+
+        // 1) Optional user-provided mappings
+        Path file = Path.of("config", "rctoys-gamepad-mappings.txt");
+        if (Files.isRegularFile(file)) {
+            try {
+                ByteBuffer buf = fileToNullTerminatedBuffer(file);
+                if (buf != null) GLFW.glfwUpdateGamepadMappings(buf);
+            } catch (IOException e) {
+                System.err.println("[rctoys] Failed to read mappings file: " + file + " (" + e + ")");
+            }
+        }
+
+        // 2) Print any GLFW error (useful!)
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            var ptr = stack.mallocPointer(1);
+            int code = GLFW.glfwGetError(ptr);
+            if (code != 0) {
+                long msgPtr = ptr.get(0);
+                String msg = msgPtr == 0L ? "" : MemoryUtil.memUTF8(msgPtr);
+                System.err.println("[rctoys] GLFW error after mappings: 0x" + Integer.toHexString(code) + " " + msg);
+            }
+        }
+
+        // 3) Debug: show whether it became a gamepad
+        int jid = ControllerSupport.JOYSTICK_ID;
+        System.out.println("[rctoys] Joystick present: " + GLFW.glfwJoystickPresent(jid));
+        System.out.println("[rctoys] Is gamepad: " + GLFW.glfwJoystickIsGamepad(jid));
+        System.out.println("[rctoys] Name: " + GLFW.glfwGetJoystickName(jid));
+        System.out.println("[rctoys] GUID: " + GLFW.glfwGetJoystickGUID(jid));
+    }
+
+    private static ByteBuffer fileToNullTerminatedBuffer(Path path) throws IOException {
+        byte[] bytes = Files.readAllBytes(path);
+        ByteBuffer buf = createByteBuffer(bytes.length + 1);
+        buf.put(bytes);
+        buf.put((byte) 0);
+        buf.flip();
+        return buf;
+    }
+
+    public static void ensureConfigExists() {
+        if (initialized) return;
+        initialized = true;
+
+        // Minecraft root directory
+        Path gameDir = Minecraft.getInstance().gameDirectory.toPath();
+
+        // config folder (already exists)
+        Path configDir = gameDir.resolve("config");
+
+        // your file
+        Path file = configDir.resolve("rctoys-gamepad-mappings.txt");
+
+        if (!Files.exists(file)) {
+            try {
+                Files.createDirectories(configDir);
+
+                // Default template
+                String template = """
+                        # RC Toys controller mappings
+                        # Paste SDL_GameControllerDB lines here.
+                        #
+                        # Example:
+                        # 03000000...,Controller Name,a:b0,b:b1,x:b2,y:b3,leftx:a0,lefty:a1,...
+                        #
+                        # You can copy from:
+                        # https://github.com/gabomdq/SDL_GameControllerDB
+                        """;
+
+                Files.writeString(file, template);
+
+                System.out.println("[RCToys] Created default controller mapping file: " + file);
+            } catch (IOException e) {
+                System.err.println("[RCToys] Failed to create controller config!");
+                e.printStackTrace();
+            }
+        }
+    }
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\input\RCToyKeybinds.java
+
+package rctoys.client.input;
+
+import com.mojang.blaze3d.platform.InputConstants;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.minecraft.client.KeyMapping;
+import net.minecraft.resources.Identifier;
+import org.lwjgl.glfw.GLFW;
+import rctoys.RCToysMod;
+
+/**
+ * Rebindable RC controls that show up in Options -> Controls.
+ */
+public final class RCToyKeybinds {
+    // Custom category (newer MC uses a Category object, not a String)
+    public static final KeyMapping.Category CATEGORY =
+        KeyMapping.Category.register(Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "controls"));
+
+    // Mirrors old behavior by default (WASD/Space/Shift) but now configurable.
+    public static KeyMapping FORWARD;
+    public static KeyMapping BACK;
+    public static KeyMapping LEFT;
+    public static KeyMapping RIGHT;
+    public static KeyMapping JUMP;
+    public static KeyMapping SHIFT;
+
+    // Replaces hardcoded V
+    public static KeyMapping TOGGLE_FPV;
+
+    private RCToyKeybinds() {}
+
+    public static void register() {
+        FORWARD = register("key.rctoys.forward", GLFW.GLFW_KEY_W);
+        BACK    = register("key.rctoys.back",    GLFW.GLFW_KEY_S);
+        LEFT    = register("key.rctoys.left",    GLFW.GLFW_KEY_A);
+        RIGHT   = register("key.rctoys.right",   GLFW.GLFW_KEY_D);
+        JUMP    = register("key.rctoys.jump",    GLFW.GLFW_KEY_SPACE);
+        SHIFT   = register("key.rctoys.shift",   GLFW.GLFW_KEY_LEFT_SHIFT);
+
+        TOGGLE_FPV = register("key.rctoys.toggle_fpv", GLFW.GLFW_KEY_V);
+    }
+
+    private static KeyMapping register(String translationKey, int defaultKey) {
+        return KeyBindingHelper.registerKeyBinding(new KeyMapping(
+            translationKey,
+            InputConstants.Type.KEYSYM,
+            defaultKey,
+            CATEGORY
+        ));
+    }
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\render\entity\AbstractRCEntityRenderer.java
+
+package rctoys.client.render.entity;
+
+import com.mojang.blaze3d.vertex.PoseStack;
+import net.minecraft.client.model.EntityModel;
+import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.client.renderer.entity.EntityRenderer;
+import net.minecraft.client.renderer.entity.EntityRendererProvider.Context;
+import net.minecraft.client.renderer.rendertype.RenderTypes;
+import net.minecraft.client.renderer.state.CameraRenderState;
+import net.minecraft.client.renderer.texture.OverlayTexture;
+import net.minecraft.resources.Identifier;
+import net.minecraft.util.CommonColors;
+import rctoys.client.render.entity.state.RCEntityRenderState;
+import rctoys.entity.AbstractRCEntity;
+
+public abstract class AbstractRCEntityRenderer extends EntityRenderer<AbstractRCEntity, RCEntityRenderState>
+{
+	public AbstractRCEntityRenderer(Context context)
+	{
+		super(context);
+	}
+
+    @Override
+	public void submit(RCEntityRenderState state, PoseStack matrices, SubmitNodeCollector queue, CameraRenderState cameraState)
+	{
+		matrices.pushPose();
+		matrices.translate(0.0f, state.boundingBoxHeight * 0.5f, 0.0f);
+        matrices.mulPose(state.quaternion);
+        matrices.scale(-1.0f, -1.0f, 1.0f);
+
+        queue.submitModel(getModel(), state, matrices, RenderTypes.entityCutoutNoCull(getBaseTexture()), state.lightCoords, OverlayTexture.NO_OVERLAY, CommonColors.WHITE, null, state.outlineColor, null);
+        queue.submitModel(getModel(), state, matrices, RenderTypes.entityCutoutNoCull(getColorTexture()), state.lightCoords, OverlayTexture.NO_OVERLAY, (state.color & 0x00FFFFFF) | 0xFF000000, null, state.outlineColor, null);
+
+        if(state.enabled)
+            queue.submitModel(getModel(), state, matrices, RenderTypes.eyes(getEmissiveTexture()), state.lightCoords, OverlayTexture.NO_OVERLAY, CommonColors.WHITE, null, state.outlineColor, null);
+
+		matrices.popPose();
+		super.submit(state, matrices, queue, cameraState);
+	}
+	
+	protected abstract EntityModel<RCEntityRenderState> getModel();
+	
+	protected abstract Identifier getBaseTexture();
+	
+	protected abstract Identifier getColorTexture();
+	
+	protected abstract Identifier getEmissiveTexture();
+
+	@Override
+	public RCEntityRenderState createRenderState()
+	{
+		return new RCEntityRenderState();
+	}
+
+    @Override
+	public void extractRenderState(AbstractRCEntity entity, RCEntityRenderState state, float tickProgress)
+	{
+		super.extractRenderState(entity, state, tickProgress);
+		state.color = entity.getColor();
+		state.enabled = entity.isEnabled();
+		state.quaternion = entity.getLerpedQuaternion(tickProgress);
+	}
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\render\entity\CarEntityRenderer.java
+
+package rctoys.client.render.entity;
+
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.model.EntityModel;
+import net.minecraft.client.renderer.entity.EntityRendererProvider.Context;
+import net.minecraft.resources.Identifier;
+import rctoys.RCToysMod;
+import rctoys.client.RCToysModClient;
+import rctoys.client.render.entity.model.CarEntityModel;
+import rctoys.client.render.entity.state.RCEntityRenderState;
+
+@Environment(EnvType.CLIENT)
+public class CarEntityRenderer extends AbstractRCEntityRenderer
+{
+	private static final Identifier BASE = Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "textures/entity/car/car_base.png");
+	private static final Identifier COLOR = Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "textures/entity/car/car_color.png");
+	private static final Identifier EMISSIVE = Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "textures/entity/car/car_emissive.png");
+	
+	private final EntityModel<RCEntityRenderState> model;
+	
+	public CarEntityRenderer(Context context)
+	{
+		super(context);
+		this.model = new CarEntityModel(context.bakeLayer(RCToysModClient.MODEL_CAR_LAYER));
+	}
+
+	@Override
+	protected EntityModel<RCEntityRenderState> getModel()
+	{
+		return model;
+	}
+
+	@Override
+	protected Identifier getBaseTexture()
+	{
+		return BASE;
+	}
+
+	@Override
+	protected Identifier getColorTexture()
+	{
+		return COLOR;
+	}
+
+	@Override
+	protected Identifier getEmissiveTexture()
+	{
+		return EMISSIVE;
+	}
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\render\entity\PlaneEntityRenderer.java
+
+package rctoys.client.render.entity;
+
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.model.EntityModel;
+import net.minecraft.client.renderer.entity.EntityRendererProvider.Context;
+import net.minecraft.resources.Identifier;
+import rctoys.RCToysMod;
+import rctoys.client.RCToysModClient;
+import rctoys.client.render.entity.model.PlaneEntityModel;
+import rctoys.client.render.entity.state.RCEntityRenderState;
+
+@Environment(EnvType.CLIENT)
+public class PlaneEntityRenderer extends AbstractRCEntityRenderer
+{
+	private static final Identifier BASE = Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "textures/entity/plane/plane_base.png");
+	private static final Identifier COLOR = Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "textures/entity/plane/plane_color.png");
+	private static final Identifier EMISSIVE = Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "textures/entity/plane/plane_emissive.png");
+	
+	private final EntityModel<RCEntityRenderState> model;
+	
+	public PlaneEntityRenderer(Context context)
+	{
+		super(context);
+		this.model = new PlaneEntityModel(context.bakeLayer(RCToysModClient.MODEL_PLANE_LAYER));
+	}
+
+	@Override
+	protected EntityModel<RCEntityRenderState> getModel()
+	{
+		return model;
+	}
+
+	@Override
+	protected Identifier getBaseTexture()
+	{
+		return BASE;
+	}
+
+	@Override
+	protected Identifier getColorTexture()
+	{
+		return COLOR;
+	}
+
+	@Override
+	protected Identifier getEmissiveTexture()
+	{
+		return EMISSIVE;
+	}
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\render\entity\model\CarEntityModel.java
+
+package rctoys.client.render.entity.model;
+
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.model.EntityModel;
+import net.minecraft.client.model.geom.ModelPart;
+import net.minecraft.client.model.geom.PartPose;
+import net.minecraft.client.model.geom.builders.CubeDeformation;
+import net.minecraft.client.model.geom.builders.CubeListBuilder;
+import net.minecraft.client.model.geom.builders.LayerDefinition;
+import net.minecraft.client.model.geom.builders.MeshDefinition;
+import net.minecraft.client.model.geom.builders.PartDefinition;
+import rctoys.client.render.entity.state.RCEntityRenderState;
+
+@Environment(EnvType.CLIENT)
+public class CarEntityModel extends EntityModel<RCEntityRenderState>
+{
+	public CarEntityModel(ModelPart modelPart)
+	{
+		super(modelPart);
+	}
+	
+	public static LayerDefinition getTexturedModelData()
+	{
+		MeshDefinition modelData = new MeshDefinition();
+		PartDefinition modelPartData = modelData.getRoot();
+		modelPartData.addOrReplaceChild("body", CubeListBuilder.create().texOffs(0, 0).addBox(-2.0F, -2.0F, -4.0F, 4.0F, 2.0F, 8.0F, new CubeDeformation(0.0F))
+		.texOffs(0, 10).addBox(-2.0F, -3.0F, -2.0F, 4.0F, 1.0F, 5.0F, new CubeDeformation(0.0F)), PartPose.offset(0.0F, 1.5F, 0.0F));
+		modelPartData.addOrReplaceChild("wheels", CubeListBuilder.create().texOffs(18, 10).addBox(-1.0F, -2.0F, -0.5F, 1.0F, 2.0F, 2.0F, new CubeDeformation(0.0F))
+		.texOffs(18, 10).addBox(-1.0F, -2.0F, 4.5F, 1.0F, 2.0F, 2.0F, new CubeDeformation(0.0F))
+		.texOffs(18, 10).addBox(-5.0F, -2.0F, -0.5F, 1.0F, 2.0F, 2.0F, new CubeDeformation(0.0F))
+		.texOffs(18, 10).addBox(-5.0F, -2.0F, 4.5F, 1.0F, 2.0F, 2.0F, new CubeDeformation(0.0F)), PartPose.offset(2.5F, 2.0F, -3.0F));
+		modelPartData.addOrReplaceChild("bb_main", CubeListBuilder.create().texOffs(0, 16).addBox(-2.0F, -4.5F, 2.0F, 4.0F, 0.0F, 2.0F, new CubeDeformation(0.0F))
+		.texOffs(18, 14).addBox(-2.0F, -4.5F, 2.0F, 0.0F, 1.0F, 1.0F, new CubeDeformation(0.0F))
+		.texOffs(18, 16).addBox(2.0F, -4.5F, 2.0F, 0.0F, 1.0F, 1.0F, new CubeDeformation(0.0F)), PartPose.offset(0.0F, 2.0F, 0.0F));
+		return LayerDefinition.create(modelData, 32, 32);
+	}
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\render\entity\model\PlaneEntityModel.java
+
+package rctoys.client.render.entity.model;
+
+import com.mojang.math.Axis;
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.model.EntityModel;
+import net.minecraft.client.model.geom.ModelPart;
+import net.minecraft.client.model.geom.PartPose;
+import net.minecraft.client.model.geom.builders.CubeDeformation;
+import net.minecraft.client.model.geom.builders.CubeListBuilder;
+import net.minecraft.client.model.geom.builders.LayerDefinition;
+import net.minecraft.client.model.geom.builders.MeshDefinition;
+import net.minecraft.client.model.geom.builders.PartDefinition;
+import rctoys.client.render.entity.state.RCEntityRenderState;
+
+@Environment(EnvType.CLIENT)
+public class PlaneEntityModel extends EntityModel<RCEntityRenderState>
+{
+	private final ModelPart prop;
+	
+	public PlaneEntityModel(ModelPart modelPart)
+	{
+		super(modelPart);
+		this.prop = modelPart.getChild("prop");
+	}
+
+	public static LayerDefinition getTexturedModelData()
+	{
+		MeshDefinition modelData = new MeshDefinition();
+		PartDefinition modelPartData = modelData.getRoot();
+		modelPartData.addOrReplaceChild("body", CubeListBuilder.create().texOffs(0, 12).addBox(-1.0F, -3.0F, -6.0F, 2.0F, 2.0F, 10.0F, new CubeDeformation(0.0F)).texOffs(9, 24).addBox(0.0F, -3.0F, 4.0F, 0.0F, 1.0F, 2.0F, new CubeDeformation(0.0F)).texOffs(24, 13).addBox(-1.0F, -2.0F, -7.0F, 2.0F, 1.0F, 1.0F, new CubeDeformation(0.0F)), PartPose.offset(0.0F, 2.0F, 0.0F));
+		modelPartData.addOrReplaceChild("wings", CubeListBuilder.create().texOffs(0, 0).addBox(-11.0F, -3.0F, -4.0F, 10.0F, 0.0F, 6.0F, new CubeDeformation(0.0F)).texOffs(0, 6).addBox(1.0F, -3.0F, -4.0F, 10.0F, 0.0F, 6.0F, new CubeDeformation(0.0F)).texOffs(0, 24).addBox(0.0F, -5.0F, 3.0F, 0.0F, 2.0F, 4.0F, new CubeDeformation(0.0F)).texOffs(13, 12).addBox(-2.0F, -2.0F, 4.0F, 4.0F, 0.0F, 3.0F, new CubeDeformation(0.0F)), PartPose.offset(0.0F, 2.0F, 0.0F));
+		PartDefinition gear = modelPartData.addOrReplaceChild("gear", CubeListBuilder.create().texOffs(24, 19).addBox(0.0F, -1.0F, 6.0F, 0.0F, 1.0F, 2.0F, new CubeDeformation(0.0F)), PartPose.offset(0.0F, 2.0F, -5.0F));
+		gear.addOrReplaceChild("cube_r1", CubeListBuilder.create().texOffs(16, 24).addBox(0.0F, -1.0F, -1.0F, 0.0F, 2.0F, 2.0F, new CubeDeformation(0.0F)), PartPose.offsetAndRotation(-1.5F, -0.75F, 1.0F, 0.0F, 0.0F, 0.7854F));
+		gear.addOrReplaceChild("cube_r2", CubeListBuilder.create().texOffs(24, 15).addBox(0.0F, -1.0F, -1.0F, 0.0F, 2.0F, 2.0F, new CubeDeformation(0.0F)), PartPose.offsetAndRotation(1.5F, -0.75F, 1.0F, 0.0F, 0.0F, -0.7854F));
+		modelPartData.addOrReplaceChild("prop", CubeListBuilder.create().texOffs(24, 12).addBox(-2.0F, -0.5F, -0.01F, 4.0F, 1.0F, 0.0F, new CubeDeformation(0.0F)), PartPose.offset(0.0F, 0.0F, -7.0F));
+		return LayerDefinition.create(modelData, 32, 32);
+	}
+
+	public void setupAnim(RCEntityRenderState state)
+	{
+		super.setupAnim(state);
+		
+		if(state.enabled)
+			this.prop.rotateBy(Axis.ZP.rotationDegrees(state.ageInTicks * 64.0f));
+	}
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\render\entity\state\RCEntityRenderState.java
+
+package rctoys.client.render.entity.state;
+
+import org.joml.Quaternionf;
+
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.renderer.entity.state.EntityRenderState;
+
+@Environment(EnvType.CLIENT)
+public class RCEntityRenderState extends EntityRenderState
+{
+	public int color;
+	public boolean enabled;
+	public Quaternionf quaternion;
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\sound\DynamicSoundManager.java
+
+package rctoys.client.sound;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.world.entity.Entity;
+import rctoys.entity.AbstractRCEntity;
+import rctoys.network.c2s.MotorSoundS2CPacket;
+
+public class DynamicSoundManager
+{
+	private static DynamicSoundManager instance;
+	private final List<RCMotorSound> activeSounds = new ArrayList<>();
+
+	private DynamicSoundManager()
+	{
+	}
+
+	public static DynamicSoundManager getInstance()
+	{
+		if(instance == null)
+			instance = new DynamicSoundManager();
+
+		return instance;
+	}
+	
+	public <T extends RCMotorSound> void play(T soundInstance)
+	{
+		if(this.activeSounds.contains(soundInstance))
+			return;
+
+		Minecraft client = Minecraft.getInstance();
+		client.getSoundManager().play(soundInstance);
+		this.activeSounds.add(soundInstance);
+	}
+	
+	public Optional<RCMotorSound> getPlayingSoundInstance(SoundEvent soundEvent)
+	{
+		for(var activeSound : this.activeSounds)
+		{
+			if(activeSound.getIdentifier().equals(soundEvent.location()))
+				return Optional.of(activeSound);
+		}
+
+		return Optional.empty();
+	}
+	
+	public static void receiveSoundPacket(MotorSoundS2CPacket payload, ClientPlayNetworking.Context context)
+	{
+		int entityID = payload.entityID();
+		boolean enable = payload.enable();
+		Identifier soundID = payload.sound();
+		Minecraft client = context.client();
+		
+		client.execute(() -> {
+			Entity entity = client.level.getEntity(entityID);
+			SoundEvent sound = BuiltInRegistries.SOUND_EVENT.getValue(soundID);
+			
+			if(entity != null && entity instanceof AbstractRCEntity)
+			{
+				DynamicSoundManager instance = getInstance();
+				
+				if(enable)
+					instance.play(new RCMotorSound((AbstractRCEntity) entity, sound));
+				else
+					instance.getPlayingSoundInstance(sound).ifPresent(s -> client.getSoundManager().stop(s));
+			}
+		});
+	}
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\client\sound\RCMotorSound.java
+
+package rctoys.client.sound;
+
+import net.minecraft.client.resources.sounds.AbstractTickableSoundInstance;
+import net.minecraft.client.resources.sounds.SoundInstance;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.util.Mth;
+import rctoys.entity.AbstractRCEntity;
+
+public class RCMotorSound extends AbstractTickableSoundInstance
+{
+	private final AbstractRCEntity entity;
+
+	public RCMotorSound(AbstractRCEntity entity, SoundEvent motorSound)
+	{
+		super(motorSound, SoundSource.NEUTRAL, SoundInstance.createUnseededRandom());
+		this.entity = entity;
+		this.looping = true;
+		this.delay = 0;
+		this.volume = 0.0f;
+	}
+
+    @Override
+    public boolean canStartSilent() {
+        return true;
+    }
+
+	@Override
+	public void tick() {
+        if (entity.isRemoved()) {
+            this.stop();
+            return;
+        }
+
+        this.x = entity.getX();
+        this.y = entity.getY();
+        this.z = entity.getZ();
+
+        if (entity.isEnabled() && Math.abs(entity.getThrottle()) > 0.0f) {
+            this.volume = Mth.clamp(this.volume + 0.05f, 0.0f, 1.0f);
+            this.pitch = Mth.clamp(this.pitch + 0.01f, 0.7f, 1.0f);
+        } else {
+            this.volume = Mth.clamp(this.volume - 0.05f, 0.0f, 1.0f);
+            this.pitch = Mth.clamp(this.pitch - 0.01f, 0.7f, 1.0f);
+        }
+    }
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\mixin\client\CameraMixin.java
+
+package rctoys.mixin.client;
+
+import net.minecraft.util.Mth;
+import net.minecraft.world.level.Level;
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.ModifyVariable;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.Camera;
+import net.minecraft.client.Minecraft;
+import net.minecraft.world.entity.Entity;
+import rctoys.client.RCToysModClient;
+import rctoys.entity.AbstractRCEntity;
+
+@Environment(EnvType.CLIENT)
+@Mixin(Camera.class)
+public abstract class CameraMixin
+{
+    @Shadow private Level level;
+    @Shadow private Entity entity;
+    @Shadow private float xRot;
+    @Shadow private float yRot;
+    @Shadow private boolean detached;
+    @Shadow @Final private Quaternionf rotation;
+    @Shadow @Final private static Vector3f FORWARDS;
+    @Shadow @Final private Vector3f forwards;
+    @Shadow @Final private static Vector3f UP;
+    @Shadow @Final private Vector3f up;
+    @Shadow @Final private static Vector3f LEFT;
+    @Shadow @Final private Vector3f left;
+
+    @Shadow
+    protected abstract void setRotation(float f, float g);
+
+    @Shadow
+    protected abstract void setPosition(double d, double e, double f);
+
+    @Shadow
+    protected abstract void move(float f, float g, float h);
+
+    @Shadow
+    protected abstract float getMaxZoom(float f);
+
+    @Inject(method = "setup", at = @At("HEAD"), cancellable = true)
+    private void setupInject(Level level, Entity entity, boolean bl, boolean bl2, float f, CallbackInfo info) {
+        Minecraft client = Minecraft.getInstance();
+        this.level = level;
+        this.entity = entity;
+        this.detached = bl;
+
+        if(RCToysModClient.fpvUUID != null && client.level != null) {
+            Entity fpvEntity = client.level.getEntity(RCToysModClient.fpvUUID);
+
+            if(fpvEntity != null && fpvEntity instanceof AbstractRCEntity) {
+                if(bl) {
+                    this.setRotation(entity.getViewYRot(f), entity.getViewXRot(f));
+
+                    if(bl2)
+                        this.setRotation(this.yRot + 180.0f, -this.xRot);
+                } else {
+                    // Point the camera in the forward direction while in FPV mode.
+                    float partialTicks = client.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+                    Quaternionf quaternion = ((AbstractRCEntity) fpvEntity).getLerpedQuaternion(partialTicks);
+                    this.rotation.set(quaternion);
+                    FORWARDS.rotate(this.rotation, this.forwards);
+                    UP.rotate(this.rotation, this.up);
+                    LEFT.rotate(this.rotation, this.left);
+                }
+
+                // Track the RC entity being controlled.
+                this.setPosition(
+                        Mth.lerp(f, fpvEntity.xo, fpvEntity.getX()),
+                        Mth.lerp(f, fpvEntity.yo, fpvEntity.getY()) + fpvEntity.getEyeHeight(),
+                        Mth.lerp(f, fpvEntity.zo, fpvEntity.getZ())
+                );
+
+                if(bl) {
+                    float i = 4.0f;
+                    float j = 1.0f;
+                    this.move(-this.getMaxZoom(i * j), 0.0f, 0.0f);
+                }
+
+                info.cancel();
+            }
+        }
+    }
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\mixin\client\ClientChunkCacheStorageMixin.java
+
+package rctoys.mixin.client;
+
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+import rctoys.client.RCToysModClient;
+
+@Mixin(targets = "net.minecraft.client.multiplayer.ClientChunkCache$Storage")
+public abstract class ClientChunkCacheStorageMixin {
+    @Inject(method = "inRange", at = @At("RETURN"), cancellable = true)
+    private void inRangeInject(int i, int j, CallbackInfoReturnable<Boolean> info) {
+        if(RCToysModClient.fpvUUID != null)
+            info.setReturnValue(true);
+    }
+}
+-------------------------------------------
+FILE: .\client\java\rctoys\mixin\client\LevelRendererMixin.java
+
+package rctoys.mixin.client;
+
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.client.Camera;
+import net.minecraft.client.DeltaTracker;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.culling.Frustum;
+import net.minecraft.client.renderer.entity.state.EntityRenderState;
+import net.minecraft.client.renderer.state.LevelRenderState;
+import net.minecraft.world.TickRateManager;
+import net.minecraft.world.entity.Entity;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Redirect;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import rctoys.client.RCToysModClient;
+import rctoys.entity.AbstractRCEntity;
+
+@Environment(EnvType.CLIENT)
+@Mixin(LevelRenderer.class)
+public abstract class LevelRendererMixin
+{
+    /**
+     * Redirect the camera entity.
+     */
+    @Redirect(method = "extractVisibleEntities", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/Camera;entity()Lnet/minecraft/world/entity/Entity;"))
+    private Entity redirectEntity(Camera camera) {
+        if(RCToysModClient.fpvUUID != null && !camera.isDetached()) {
+            Minecraft client = Minecraft.getInstance();
+            Entity fpvEntity = client.level.getEntity(RCToysModClient.fpvUUID);
+
+            if(fpvEntity != null)
+                return fpvEntity;
+        }
+
+        return camera.entity();
+    }
+}
+-------------------------------------------
+FILE: .\client\resources\rctoys.client.mixins.json
+
+{
+	"required": true,
+	"package": "rctoys.mixin.client",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"CameraMixin",
+        "LevelRendererMixin",
+        "ClientChunkCacheStorageMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\RCToysMod.java
+
+package rctoys;
+
+import java.util.function.Function;
+import java.util.function.UnaryOperator;
+
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.itemgroup.v1.FabricItemGroup;
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.core.Registry;
+import net.minecraft.core.component.DataComponentType;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.MobCategory;
+import net.minecraft.world.item.CreativeModeTab;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.ItemLike;
+import rctoys.entity.AbstractRCEntity;
+import rctoys.entity.CarEntity;
+import rctoys.entity.PlaneEntity;
+import rctoys.item.RCToyItem;
+import rctoys.item.RemoteItem;
+import rctoys.item.RemoteLinkComponent;
+import rctoys.network.c2s.MotorSoundS2CPacket;
+import rctoys.network.c2s.RemoteControlC2SPacket;
+import rctoys.network.c2s.RemoteControlAnalogC2SPacket;
+import rctoys.network.c2s.TrackingPlayerC2SPacket;
+
+public class RCToysMod implements ModInitializer
+{
+	public static final String MOD_ID = "rctoys";
+
+	public static final EntityType<CarEntity> CAR = registerEntity("rc_car", EntityType.Builder.of(CarEntity::new, MobCategory.MISC).sized(0.4f, 0.25f).eyeHeight(0.15F).clientTrackingRange(32));
+	public static final EntityType<PlaneEntity> PLANE = registerEntity("rc_plane", EntityType.Builder.of(PlaneEntity::new, MobCategory.MISC).sized(0.75f, 0.25f).eyeHeight(0.15F).clientTrackingRange(32));
+
+	public static final Item REMOTE = registerItem("remote", settings -> new RemoteItem(settings));
+	public static final Item CAR_ITEM = registerItem("rc_car", settings -> new RCToyItem(CAR, settings));
+	public static final Item PLANE_ITEM = registerItem("rc_plane", settings -> new RCToyItem(PLANE, settings));
+	public static final Item RESONATING_CIRCUIT = registerItem("resonating_circuit", settings -> new Item(settings));
+	public static final Item MOTOR = registerItem("motor", settings -> new Item(settings));
+    public static final Item WHEELS = registerItem("wheels", settings -> new Item(settings));
+    public static final Item PROPELLER = registerItem("propeller", settings -> new Item(settings));
+    public static final Item AERO_SURFACE = registerItem("aero_surface", settings -> new Item(settings));
+
+	public static final CreativeModeTab RC_TOYS_ITEM_GROUP = registerItemGroup("rc_toys", CAR_ITEM);
+
+	public static final DataComponentType<RemoteLinkComponent> REMOTE_LINK = registerItemComponent("remote_link", builder -> builder.persistent(RemoteLinkComponent.CODEC).networkSynchronized(RemoteLinkComponent.PACKET_CODEC));
+
+	public static final SoundEvent REMOTE_LINK_SOUND = Registry.register(BuiltInRegistries.SOUND_EVENT, Identifier.fromNamespaceAndPath(MOD_ID, "remote_link"), SoundEvent.createVariableRangeEvent(Identifier.fromNamespaceAndPath(MOD_ID, "remote_link")));
+	public static final SoundEvent CAR_LOOP_SOUND = Registry.register(BuiltInRegistries.SOUND_EVENT, Identifier.fromNamespaceAndPath(MOD_ID, "car_loop"), SoundEvent.createVariableRangeEvent(Identifier.fromNamespaceAndPath(MOD_ID, "car_loop")));
+    public static final SoundEvent PLANE_LOOP_SOUND = Registry.register(BuiltInRegistries.SOUND_EVENT, Identifier.fromNamespaceAndPath(MOD_ID, "plane_loop"), SoundEvent.createVariableRangeEvent(Identifier.fromNamespaceAndPath(MOD_ID, "plane_loop")));
+
+	@Override
+	public void onInitialize()
+	{
+	    PayloadTypeRegistry.playS2C().register(MotorSoundS2CPacket.ID, MotorSoundS2CPacket.CODEC);
+	
+	    PayloadTypeRegistry.playC2S().register(RemoteControlC2SPacket.ID, RemoteControlC2SPacket.CODEC);
+	    PayloadTypeRegistry.playC2S().register(RemoteControlAnalogC2SPacket.ID, RemoteControlAnalogC2SPacket.CODEC); // <-- ADD
+	
+	    PayloadTypeRegistry.playC2S().register(TrackingPlayerC2SPacket.ID, TrackingPlayerC2SPacket.CODEC);
+	
+	    ServerPlayNetworking.registerGlobalReceiver(RemoteControlC2SPacket.ID, (payload, context) -> AbstractRCEntity.receiveControl(payload, context));
+	    ServerPlayNetworking.registerGlobalReceiver(RemoteControlAnalogC2SPacket.ID, (payload, context) -> AbstractRCEntity.receiveAnalogControl(payload, context)); // <-- ADD
+	    ServerPlayNetworking.registerGlobalReceiver(TrackingPlayerC2SPacket.ID, (payload, context) -> AbstractRCEntity.receiveTrackingPlayer(payload, context));
+	}
+
+	private static <T extends Entity> EntityType<T> registerEntity(String id, EntityType.Builder<T> type)
+	{
+		ResourceKey<EntityType<?>> key = ResourceKey.create(Registries.ENTITY_TYPE, Identifier.fromNamespaceAndPath(MOD_ID, id));
+		EntityType<T> entityType = Registry.register(BuiltInRegistries.ENTITY_TYPE, key, type.build(key));
+		return entityType;
+	}
+
+	public static Item registerItem(String id, Function<Item.Properties, Item> factory)
+	{
+		ResourceKey<Item> key = ResourceKey.create(Registries.ITEM, Identifier.fromNamespaceAndPath(MOD_ID, id));
+		Item item = factory.apply(new Item.Properties().setId(key));
+		return Registry.register(BuiltInRegistries.ITEM, key, item);
+	}
+
+	private static <T> DataComponentType<T> registerItemComponent(String id, UnaryOperator<DataComponentType.Builder<T>> builderOperator)
+	{
+		return Registry.register(BuiltInRegistries.DATA_COMPONENT_TYPE, Identifier.fromNamespaceAndPath(MOD_ID, id), builderOperator.apply(DataComponentType.builder()).build());
+	}
+
+    public static CreativeModeTab registerItemGroup(String id, ItemLike icon)
+    {
+        ResourceKey<CreativeModeTab> key = ResourceKey.create(Registries.CREATIVE_MODE_TAB, Identifier.fromNamespaceAndPath(MOD_ID, id));
+        CreativeModeTab.DisplayItemsGenerator collector = (displayContext, entries) -> BuiltInRegistries.ITEM.forEach(item -> {
+            if(BuiltInRegistries.ITEM.getKey(item).getNamespace().equals(MOD_ID))
+                entries.accept(item);
+        });
+        CreativeModeTab itemGroup = FabricItemGroup.builder().icon(() -> new ItemStack(icon)).title(Component.translatable("rctoys.itemGroup")).displayItems(collector).build();
+        return Registry.register(BuiltInRegistries.CREATIVE_MODE_TAB, key, itemGroup);
+    }
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\entity\AbstractRCEntity.java
+
+package rctoys.entity;
+
+import com.mojang.authlib.GameProfile;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.syncher.EntityDataAccessor;
+import net.minecraft.network.syncher.EntityDataSerializers;
+import net.minecraft.network.syncher.SynchedEntityData;
+import net.minecraft.server.level.*;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.util.CommonColors;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.InterpolationHandler;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.component.DyedItemColor;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.gamerules.GameRules;
+import net.minecraft.world.level.storage.ValueInput;
+import net.minecraft.world.level.storage.ValueOutput;
+import org.joml.Quaternionf;
+import rctoys.RCToysMod;
+import rctoys.item.RemoteItem;
+import rctoys.item.RemoteLinkComponent;
+import rctoys.network.c2s.MotorSoundS2CPacket;
+import rctoys.network.c2s.RemoteControlAnalogC2SPacket;
+import rctoys.network.c2s.RemoteControlC2SPacket;
+import rctoys.network.c2s.TrackingPlayerC2SPacket;
+
+import java.util.UUID;
+
+public abstract class AbstractRCEntity extends Entity
+{
+	private static final EntityDataAccessor<Integer> COLOR = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.INT);
+	private static final EntityDataAccessor<Boolean> ENABLED = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.BOOLEAN);
+	private static final EntityDataAccessor<Float> QX = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.FLOAT);
+	private static final EntityDataAccessor<Float> QY = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.FLOAT);
+	private static final EntityDataAccessor<Float> QZ = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.FLOAT);
+	private static final EntityDataAccessor<Float> QW = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.FLOAT);
+	private static final EntityDataAccessor<Float> THROTTLE = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.FLOAT);
+
+	// --- Analog control state (server-side) ---
+	// These are optional: by default we convert analog -> legacy 6 booleans and call remoteControlInput(...)
+	// Once you update PlaneEntity, you can override remoteControlAnalogInput(...) and use these values directly.
+	protected float ctrlPitch;     // -1..1
+	protected float ctrlRoll;      // -1..1
+	protected float ctrlYaw;       // -1..1
+	protected float ctrlThrottle;  // -1..1
+	protected boolean ctrlBrake;
+	protected int ctrlTicksSinceUpdate = 0;
+
+	private final InterpolationHandler interpolator = new InterpolationHandler(this, 3);
+	public Quaternionf clientQuaternion;
+	public Quaternionf clientQuaternionPrevious;
+
+	public FakePlayerRC fakePlayer;
+	public ServerPlayer trackingPlayer;
+
+	public AbstractRCEntity(EntityType<?> entityType, Level world)
+	{
+		super(entityType, world);
+	}
+
+	@Override
+	protected void defineSynchedData(SynchedEntityData.Builder builder)
+	{
+		builder.define(COLOR, Integer.valueOf(getDefaultColor()));
+		builder.define(ENABLED, false);
+		builder.define(QX, Float.valueOf(0.0f));
+		builder.define(QY, Float.valueOf(0.0f));
+		builder.define(QZ, Float.valueOf(0.0f));
+		builder.define(QW, Float.valueOf(1.0f));
+		builder.define(THROTTLE, Float.valueOf(0.0f));
+	}
+
+	public void setColor(int color)
+	{
+		this.entityData.set(COLOR, color);
+	}
+
+	public int getColor()
+	{
+		return this.entityData.get(COLOR).intValue();
+	}
+
+	public abstract int getDefaultColor();
+
+	public void setEnabled(boolean enabled)
+	{
+		if(enabled && !isEnabled())
+			this.playSound(RCToysMod.REMOTE_LINK_SOUND, 2.0f, 0.7f);
+
+		this.entityData.set(ENABLED, enabled);
+	}
+
+	public boolean isEnabled()
+	{
+		return this.entityData.get(ENABLED).booleanValue();
+	}
+
+	public void setQuaternion(Quaternionf quaternion)
+	{
+		this.entityData.set(QX, quaternion.x());
+		this.entityData.set(QY, quaternion.y());
+		this.entityData.set(QZ, quaternion.z());
+		this.entityData.set(QW, quaternion.w());
+	}
+
+	public Quaternionf getQuaternion()
+	{
+		return new Quaternionf(
+				this.entityData.get(QX).floatValue(),
+				this.entityData.get(QY).floatValue(),
+				this.entityData.get(QZ).floatValue(),
+				this.entityData.get(QW).floatValue()
+		);
+	}
+
+	public Quaternionf getLerpedQuaternion(float tickProgress)
+	{
+		if(this.clientQuaternion == null)
+			return new Quaternionf();
+		else if(tickProgress == 1.0f || this.clientQuaternionPrevious == null)
+			return this.clientQuaternion;
+
+		return new Quaternionf(this.clientQuaternionPrevious).slerp(this.clientQuaternion, tickProgress);
+	}
+
+	public void setThrottle(float throttle)
+	{
+		this.entityData.set(THROTTLE, throttle);
+	}
+
+	public float getThrottle()
+	{
+		return this.entityData.get(THROTTLE).floatValue();
+	}
+
+	@Override
+	public InterpolationHandler getInterpolation()
+	{
+		return this.interpolator;
+	}
+
+	@Override
+	public void tick()
+	{
+		super.tick();
+		this.interpolator.interpolate();
+		Level level = level();
+
+		if(level.isClientSide())
+		{
+			if(this.clientQuaternion != null)
+			{
+				this.clientQuaternionPrevious = new Quaternionf(this.clientQuaternion);
+				this.clientQuaternion = new Quaternionf(this.clientQuaternion).slerp(getQuaternion(), 0.4f);
+			}
+			else
+				this.clientQuaternion = getQuaternion();
+		}
+		else
+		{
+			// basic “stale input” tracking (optional safety)
+			if (this.ctrlTicksSinceUpdate < 1_000_000) this.ctrlTicksSinceUpdate++;
+
+			tickPhysics();
+			setQuaternion(updateQuaternion());
+
+			for(Entity other : this.level().getEntities(this, this.getBoundingBox()))
+				this.push(other);
+
+			if(this.fakePlayer != null)
+				moveFakePlayer();
+		}
+	}
+
+	public abstract void tickPhysics();
+	public abstract Quaternionf updateQuaternion();
+
+	/**
+	 * Legacy control: 6 booleans packed from the old bitmask.
+	 * Indices: 0=up, 1=down, 2=left, 3=right, 4=jump, 5=shift
+	 */
+	public abstract void remoteControlInput(boolean[] inputArray);
+
+	/**
+	 * Analog control entrypoint (new).
+	 *
+	 * Default behavior (for now):
+	 *   Convert analog to the existing 6 booleans and call remoteControlInput(...)
+	 *
+	 * When you update PlaneEntity for real granular pitch/roll,
+	 * override this method in PlaneEntity and use pitch/roll/yaw/throttle directly.
+	 */
+	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	{
+		// Store state (useful once PlaneEntity overrides and uses it)
+		this.ctrlPitch = clamp11(pitch);
+		this.ctrlRoll = clamp11(roll);
+		this.ctrlYaw = clamp11(yaw);
+		this.ctrlThrottle = clamp11(throttle);
+		this.ctrlBrake = brake;
+		this.ctrlTicksSinceUpdate = 0;
+
+		// Fallback mapping -> legacy 6 buttons.
+		// This is a *best effort* mapping without PlaneEntity code:
+		// - pitch controls forward/back
+		// - roll controls left/right
+		// - throttle controls jump/shift (up/down)
+		boolean[] input = new boolean[6];
+
+		input[0] = this.ctrlPitch > 0.25f;   // up
+		input[1] = this.ctrlPitch < -0.25f;  // down
+		input[2] = this.ctrlRoll < -0.25f;   // left
+		input[3] = this.ctrlRoll > 0.25f;    // right
+
+		// treat throttle as vertical “up/down”:
+		input[4] = this.ctrlThrottle > 0.25f;   // jump
+		input[5] = this.ctrlThrottle < -0.25f;  // shift
+
+		remoteControlInput(input);
+	}
+
+	private static float clamp11(float v) {
+		if (v < -1.0f) return -1.0f;
+		if (v > 1.0f) return 1.0f;
+		return v;
+	}
+
+	public abstract Item asItem();
+
+	@Override
+	protected double getDefaultGravity()
+	{
+		return 0.08;
+	}
+
+	@Override
+	public boolean isPushable()
+	{
+		return true;
+	}
+
+	@Override
+	public float maxUpStep()
+	{
+		return 0.5f;
+	}
+
+	@Override
+	public boolean isPickable()
+	{
+		return !this.isRemoved();
+	}
+
+	@Override
+	protected void playStepSound(BlockPos pos, BlockState state)
+	{
+	}
+
+	@Override
+	public InteractionResult interact(Player player, InteractionHand hand)
+	{
+		ItemStack stack = player.getItemInHand(hand);
+
+		if(!stack.is(RCToysMod.REMOTE))
+		{
+			// Miniature players can ride RC toys :)
+			if(player.getScale() <= 0.31)
+			{
+				player.startRiding(this);
+				return InteractionResult.SUCCESS;
+			}
+
+			return InteractionResult.PASS;
+		}
+
+		Level world = level();
+
+		if(!world.isClientSide())
+		{
+			AbstractRCEntity previousRCEntity = RemoteItem.getRCEntity(stack, (ServerLevel) world);
+
+			if(previousRCEntity != null)
+			{
+				cleanRemoteLinks(previousRCEntity.getUUID());
+				previousRCEntity.setEnabled(false);
+			}
+
+			cleanRemoteLinks(getUUID());
+			setEnabled(true);
+			stack.set(RCToysMod.REMOTE_LINK, new RemoteLinkComponent(getUUID(), getName().getString()));
+			player.displayClientMessage(Component.translatable("entity.rctoys.remote_linked"), false);
+		}
+
+		return InteractionResult.SUCCESS;
+	}
+
+	@Override
+	public boolean hurtServer(ServerLevel world, DamageSource source, float amount)
+	{
+		this.kill(world);
+
+		if(world.getGameRules().get(GameRules.ENTITY_DROPS))
+		{
+			ItemStack itemStack = new ItemStack(asItem());
+			itemStack.set(DataComponents.CUSTOM_NAME, this.getCustomName());
+
+			if(getColor() != getDefaultColor())
+				itemStack.set(DataComponents.DYED_COLOR, new DyedItemColor(getColor()));
+
+			this.spawnAtLocation(world, itemStack);
+		}
+
+		return true;
+	}
+
+	@Override
+	public void onRemoval(Entity.RemovalReason reason)
+	{
+		Level world = level();
+
+		if(world.isClientSide())
+			return;
+
+		cleanRemoteLinks(getUUID());
+	}
+
+	public SoundEvent getSoundLoop()
+	{
+		return RCToysMod.CAR_LOOP_SOUND;
+	}
+
+	@Override
+	public void startSeenByPlayer(ServerPlayer player)
+	{
+		ServerPlayNetworking.send(player, new MotorSoundS2CPacket(getId(), true, getSoundLoop().location()));
+	}
+
+	@Override
+	public void stopSeenByPlayer(ServerPlayer player)
+	{
+		ServerPlayNetworking.send(player, new MotorSoundS2CPacket(getId(), false, getSoundLoop().location()));
+	}
+
+	private void moveFakePlayer() {
+		ServerLevel serverLevel = (ServerLevel) this.level();
+		this.fakePlayer.setOldPosAndRot();
+		this.fakePlayer.setPos(this.position());
+		serverLevel.getChunkSource().move(this.fakePlayer);
+	}
+
+	private void cleanRemoteLinks(UUID rcUUID)
+	{
+		for(ServerPlayer player : ((ServerLevel) level()).players())
+		{
+			for(ItemStack stack : player.getInventory())
+			{
+				if(stack.has(RCToysMod.REMOTE_LINK))
+				{
+					UUID foundUUID = stack.get(RCToysMod.REMOTE_LINK).uuid();
+
+					if(rcUUID.equals(foundUUID))
+						stack.set(RCToysMod.REMOTE_LINK, null);
+				}
+			}
+		}
+	}
+
+	@Override
+	protected void readAdditionalSaveData(ValueInput view)
+	{
+		setColor(view.getIntOr("color", CommonColors.WHITE));
+		setQuaternion(new Quaternionf(
+				view.getFloatOr("qx", 0.0f),
+				view.getFloatOr("qy", 0.0f),
+				view.getFloatOr("qz", 0.0f),
+				view.getFloatOr("qw", 0.0f)
+		).normalize());
+	}
+
+	@Override
+	protected void addAdditionalSaveData(ValueOutput view)
+	{
+		view.putInt("color", this.entityData.get(COLOR).intValue());
+		view.putFloat("qx", this.entityData.get(QX).floatValue());
+		view.putFloat("qy", this.entityData.get(QY).floatValue());
+		view.putFloat("qz", this.entityData.get(QZ).floatValue());
+		view.putFloat("qw", this.entityData.get(QW).floatValue());
+	}
+
+	// -------------------------
+	// Network receivers
+	// -------------------------
+
+	public static void receiveControl(RemoteControlC2SPacket payload, ServerPlayNetworking.Context context)
+	{
+		int input = payload.input();
+
+		context.server().execute(() -> {
+			ServerPlayer player = context.player();
+			ItemStack stack = player.getMainHandItem();
+
+			if(stack.is(RCToysMod.REMOTE) && stack.has(RCToysMod.REMOTE_LINK))
+			{
+				UUID rcUUID = stack.get(RCToysMod.REMOTE_LINK).uuid();
+				Entity entity = player.level().getEntity(rcUUID);
+
+				if(entity instanceof AbstractRCEntity rc)
+					rc.remoteControlInput(unpackInput(input));
+			}
+		});
+	}
+
+	public static void receiveAnalogControl(RemoteControlAnalogC2SPacket payload, ServerPlayNetworking.Context context)
+	{
+		context.server().execute(() -> {
+			ServerPlayer player = context.player();
+			ItemStack stack = player.getMainHandItem();
+
+			if(stack.is(RCToysMod.REMOTE) && stack.has(RCToysMod.REMOTE_LINK))
+			{
+				UUID rcUUID = stack.get(RCToysMod.REMOTE_LINK).uuid();
+				Entity entity = player.level().getEntity(rcUUID);
+
+				if(entity instanceof AbstractRCEntity rc && rc.isEnabled())
+				{
+					rc.remoteControlAnalogInput(
+							payload.pitch(),
+							payload.roll(),
+							payload.yaw(),
+							payload.throttle(),
+							payload.brake()
+					);
+				}
+			}
+		});
+	}
+
+	public static boolean[] unpackInput(int input)
+	{
+		boolean[] inputArray = new boolean[6];
+
+		for(int i = 0; i < 6; i++)
+			inputArray[i] = ((input >> i) & 1) == 1;
+
+		return inputArray;
+	}
+
+	public static void receiveTrackingPlayer(TrackingPlayerC2SPacket payload, ServerPlayNetworking.Context context) {
+		int entityID = payload.entityID();
+		boolean enable = payload.enable();
+
+		context.server().execute(() -> {
+			ServerPlayer player = context.player();
+			ServerLevel serverLevel = player.level();
+			Entity entity = serverLevel.getEntity(entityID);
+
+			if(entity instanceof AbstractRCEntity rcEntity) {
+				if(enable) {
+					rcEntity.trackingPlayer = player;
+
+					if (rcEntity.fakePlayer == null) {
+						GameProfile gameProfile = new GameProfile(UUID.randomUUID(), "RC_Toy");
+						rcEntity.fakePlayer = new FakePlayerRC(serverLevel, gameProfile, rcEntity);
+						serverLevel.addNewPlayer(rcEntity.fakePlayer);
+					}
+				}
+				else {
+					// Reset the tracking player's client chunk view and clear the reference.
+					if(rcEntity.trackingPlayer != null) {
+						rcEntity.trackingPlayer.setChunkTrackingView(ChunkTrackingView.EMPTY);
+						rcEntity.trackingPlayer = null;
+					}
+					// Discard the chunk loading fake player.
+					if(rcEntity.fakePlayer != null) {
+						serverLevel.removePlayerImmediately(rcEntity.fakePlayer, RemovalReason.DISCARDED);
+						rcEntity.fakePlayer = null;
+					}
+				}
+			}
+		});
+	}
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\entity\CarEntity.java
+
+package rctoys.entity;
+
+import net.minecraft.util.Mth;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.MoverType;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.Level;
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
+import rctoys.RCToysMod;
+
+public class CarEntity extends AbstractRCEntity
+{
+	private int throttle;
+	private int steering;
+	
+	public CarEntity(EntityType<?> entityType, Level world)
+	{
+		super(entityType, world);
+	}
+	
+	@Override
+	public Item asItem()
+	{
+		return RCToysMod.CAR_ITEM;
+	}
+	
+	@Override
+	public int getDefaultColor()
+	{
+		return -48340;
+	}
+
+	@Override
+	public void tickPhysics()
+	{
+		if(!isEnabled())
+		{
+			throttle = 0;
+			steering = 0;
+		}
+		
+		if(onGround())
+		{
+			setDeltaMovement(getDeltaMovement().scale(throttle == 0 ? 0.9 : 0.99));
+            Vector3f velocity = getDeltaMovement().toVector3f();
+            Vector3f horizontalVelocity = new Vector3f(velocity.x(), 0.0f, velocity.z());
+            Vector3f forward = new Vector3f(0.0f, 0.0f, -1.0f).rotateY(getYRot() * -Mth.DEG_TO_RAD + Mth.PI);
+			float forwardMagnitude = horizontalVelocity.dot(forward);
+            Vector3f forwardVelocity = new Vector3f(forward).mul(forwardMagnitude);
+            Vector3f lateralVelocity = new Vector3f(horizontalVelocity).sub(forwardVelocity);
+			
+			// Forward Acceleration
+			float acc = throttle * 0.02f;
+			forwardVelocity.add(new Vector3f(forward).mul(acc));
+			
+			// Lateral Friction
+			float lateralFriction = 0.6f;
+			lateralVelocity.mul(lateralFriction);
+			
+			// New Velocity
+            Vector3f newVelocity = new Vector3f(forwardVelocity).add(lateralVelocity);
+			setDeltaMovement(newVelocity.x(), velocity.y(), newVelocity.z());
+			
+			// Steering
+		    float turnSpeed = -12.0f / (1.0f + forwardMagnitude * 2.0f);
+		    setYRot(getYRot() + steering * turnSpeed);
+		}
+		else
+		{
+			// Pitch with vertical velocity.
+		    setXRot((float) (-getDeltaMovement().y() * 100.0));
+		    
+		    // Apply Gravity
+			applyGravity();
+		}
+		
+		// Extra drag in water.
+		if(isInWater())
+			setDeltaMovement(getDeltaMovement().multiply(0.8f, 0.5f, 0.8f));
+		
+		// Move and Jump
+		double previousY = getY();
+		move(MoverType.SELF, getDeltaMovement());
+		double deltaY = getY() - previousY;
+		
+		if(deltaY > 0.1 && verticalCollision)
+		{
+			double speed = Math.hypot(getDeltaMovement().x(), getDeltaMovement().z());
+			double jump = 0.1 + Math.min(speed, 1.0);
+			push(0.0, jump, 0.0);
+		}
+	}
+	
+	@Override
+	public Quaternionf updateQuaternion()
+	{
+		Quaternionf quaternion = new Quaternionf();
+		quaternion.rotateY(getYRot() * -Mth.DEG_TO_RAD + Mth.PI);
+		quaternion.rotateX(getXRot() * -Mth.DEG_TO_RAD);
+		return quaternion;
+	}
+
+	@Override
+	public void remoteControlInput(boolean[] inputArray)
+	{
+		throttle = 0;
+		steering = 0;
+		
+		// Accelerate Forwards
+		if(inputArray[0])
+			throttle++;
+		
+		// Accelerate Backwards
+		if(inputArray[1])
+			throttle--;
+		
+		// Turn Left
+		if(inputArray[2])
+			steering++;
+		
+		// Turn Right
+		if(inputArray[3])
+			steering--;
+		
+		// Boost
+		if(inputArray[4])
+			throttle *= 2;
+		
+		setThrottle(throttle);
+	}
+	
+	@Override
+	public boolean canSpawnSprintParticle()
+	{
+		return getDeltaMovement().length() > 0.25;
+	}
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\entity\FakePlayerRC.java
+
+package rctoys.entity;
+
+import com.mojang.authlib.GameProfile;
+import net.fabricmc.fabric.api.entity.FakePlayer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.EntityDimensions;
+import net.minecraft.world.entity.Pose;
+
+public class FakePlayerRC extends FakePlayer {
+    public AbstractRCEntity rcEntity;
+
+    protected FakePlayerRC(ServerLevel world, GameProfile profile, AbstractRCEntity rcEntity) {
+        super(world, profile);
+        this.rcEntity = rcEntity;
+        this.refreshDimensions();
+    }
+
+    @Override
+    public int requestedViewDistance() {
+        if(rcEntity.trackingPlayer != null)
+            return rcEntity.trackingPlayer.requestedViewDistance();
+        else
+            return 2;
+    }
+
+    @Override
+    public EntityDimensions getDefaultDimensions(Pose pose) {
+        return EntityDimensions.fixed(0, 0);
+    }
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\entity\PlaneEntity.java
+
+package rctoys.entity;
+
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.util.Mth;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.MoverType;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.Level;
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
+import rctoys.RCToysMod;
+
+public class PlaneEntity extends AbstractRCEntity
+{
+	// Legacy digital (bitmask) controls: -1/0/+1
+	private int pitch;
+	private int roll;
+	private int throttleControl;
+
+	// Analog controls: -1..1 (pitch/roll), -1..1 throttle delta
+	private float pitchAnalog;
+	private float rollAnalog;
+	private float throttleControlAnalog;
+
+	private float throttle;
+
+	public PlaneEntity(EntityType<?> entityType, Level world)
+	{
+		super(entityType, world);
+	}
+
+	@Override
+	public Item asItem()
+	{
+		return RCToysMod.PLANE_ITEM;
+	}
+
+	@Override
+	public int getDefaultColor()
+	{
+		return -16201290;
+	}
+
+	@Override
+	public SoundEvent getSoundLoop()
+	{
+		return RCToysMod.PLANE_LOOP_SOUND;
+	}
+
+	public float getMaximumThrust()
+	{
+		return 0.05f;
+	}
+
+	@Override
+	protected double getDefaultGravity()
+	{
+		return 0.05;
+	}
+
+	@Override
+	public void tickPhysics()
+	{
+		if(!isEnabled())
+		{
+			pitch = 0;
+			roll = 0;
+			throttleControl = 0;
+
+			pitchAnalog = 0.0f;
+			rollAnalog = 0.0f;
+			throttleControlAnalog = 0.0f;
+
+			throttle = 0.0f;
+		}
+
+		// If analog hasn't been updated recently, decay it to zero so you don't get "stuck"
+		// (ctrlTicksSinceUpdate is incremented server-side in AbstractRCEntity.tick()).
+		if (this.ctrlTicksSinceUpdate > 50) {
+			pitchAnalog *= 0.85f;
+			rollAnalog *= 0.85f;
+			throttleControlAnalog *= 0.85f;
+			if (Math.abs(pitchAnalog) < 0.001f) pitchAnalog = 0.0f;
+			if (Math.abs(rollAnalog) < 0.001f) rollAnalog = 0.0f;
+			if (Math.abs(throttleControlAnalog) < 0.001f) throttleControlAnalog = 0.0f;
+		}
+
+		// Combine digital + analog (digital acts like "add ±1")
+		float pitchInput = (float)pitch + pitchAnalog;
+		float rollInput = (float)roll + rollAnalog;
+		float throttleDelta = (float)throttleControl + throttleControlAnalog;
+
+		// Clamp combined inputs to sane ranges
+		pitchInput = Mth.clamp(pitchInput, -1.0f, 1.0f);
+		rollInput = Mth.clamp(rollInput, -1.0f, 1.0f);
+		throttleDelta = Mth.clamp(throttleDelta, -1.0f, 1.0f);
+
+		// Smooth throttle like original, but now supports analog delta
+		throttle = Mth.clamp(throttle + throttleDelta * 0.1f, 0.0f, 1.0f);
+		setThrottle(throttle);
+
+		Quaternionf quaternion = getQuaternion();
+		Quaternionf invQuaternion = new Quaternionf(quaternion).invert();
+
+		Vector3f acc = new Vector3f(0.0f, 0.0f, -1.0f).rotate(quaternion).mul(getMaximumThrust() * throttle);
+		Vector3f right = new Vector3f(-1.0f, 0.0f, 0.0f).rotate(quaternion);
+
+		float wingSpan = 0.8f;
+		float wingArea = 0.5f;
+		float aspectRatio = (wingSpan * wingSpan) / wingArea;
+
+		Vector3f velocity = getDeltaMovement().toVector3f();
+		Vector3f localVelocity = new Vector3f(velocity).rotate(invQuaternion);
+
+		float stallAngle = 0.25f;
+		float angleOfAttack = (float) -Math.atan2(localVelocity.y(), -localVelocity.z());
+		float inducedLift = angleOfAttack * (aspectRatio / (aspectRatio + 2.0f)) * Mth.PI * 2.0f;
+
+		if(Math.abs(angleOfAttack) > stallAngle)
+			inducedLift *= (float) Math.cos((Math.abs(angleOfAttack) - stallAngle) * (Mth.PI / 4.0f));
+
+		float inducedDrag = (inducedLift * inducedLift) / (aspectRatio * Mth.PI);
+
+		if(Math.abs(angleOfAttack) > stallAngle)
+			inducedDrag += (Math.abs(angleOfAttack) - stallAngle) * 0.5f;
+
+		if(velocity.lengthSquared() > 1e-8f)
+		{
+			float dynamicPressure = velocity.lengthSquared() * wingArea * 1.225f * 0.5f;
+			Vector3f lift = new Vector3f(velocity).normalize().cross(right).mul(Mth.clamp(inducedLift * dynamicPressure, 0.0f, 16.0f));
+			Vector3f drag = new Vector3f(velocity).normalize((inducedDrag + 0.1f) * dynamicPressure);
+
+			if(lift.isFinite())
+				acc.add(lift);
+
+			if(drag.isFinite())
+				acc.sub(drag);
+		}
+
+		push(acc.x(), acc.y(), acc.z());
+
+		// Apply Gravity
+		applyGravity();
+
+		// Extra Drag
+		if(isInWater() || (onGround() && throttle == 0.0f))
+			setDeltaMovement(getDeltaMovement().multiply(0.8f, 0.5f, 0.8f));
+
+		// Move
+		move(MoverType.SELF, getDeltaMovement());
+	}
+
+	@Override
+	public Quaternionf updateQuaternion()
+	{
+		Quaternionf quaternion = getQuaternion();
+		Vector3f velocity = getDeltaMovement().toVector3f();
+
+		// Combine inputs exactly like physics did
+		float pitchInput = Mth.clamp((float)pitch + pitchAnalog, -1.0f, 1.0f);
+		float rollInput  = Mth.clamp((float)roll  + rollAnalog,  -1.0f, 1.0f);
+
+		if(velocity.lengthSquared() > 1e-8f)
+		{
+			Quaternionf invQuaternion = new Quaternionf(quaternion).invert();
+			Vector3f localVelocity = new Vector3f(velocity).rotate(invQuaternion).normalize();
+
+			quaternion.rotateX(localVelocity.y() * 0.1f);
+			quaternion.rotateY(localVelocity.x()  * -0.1f);
+
+			float speedFactor = Mth.clamp(velocity.length() * 0.05f, 0.0f, 0.1f);
+
+			if(!onGround())
+				quaternion.rotateZ(rollInput * speedFactor);
+
+			quaternion.rotateX(pitchInput * speedFactor);
+		}
+
+		return quaternion.normalize();
+	}
+
+	@Override
+	public void remoteControlInput(boolean[] inputArray)
+	{
+		// Digital legacy: reset each packet
+		pitch = 0;
+		roll = 0;
+		throttleControl = 0;
+
+		// Pitch Down
+		if(inputArray[0])
+			pitch--;
+
+		// Pitch Up
+		if(inputArray[1])
+			pitch++;
+
+		// Roll Left
+		if(inputArray[2])
+			roll++;
+
+		// Roll Right
+		if(inputArray[3])
+			roll--;
+
+		// Throttle Up
+		if(inputArray[4])
+			throttleControl++;
+
+		// Throttle Down
+		if(inputArray[5])
+			throttleControl--;
+	}
+
+	@Override
+	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	{
+		// Store to base fields (and reset stale timer)
+		super.remoteControlAnalogInput(pitch, roll, yaw, throttle, brake);
+
+		// For planes we use analog directly.
+		// Convention here:
+		//  pitch:   -1..1  (negative = pitch up or down depends on your controller mapping; adjust client-side invert)
+		//  roll:    -1..1
+		//  throttle:-1..1  where + increases throttle, - decreases throttle
+		this.pitchAnalog = Mth.clamp(pitch, -1.0f, 1.0f);
+		this.rollAnalog = Mth.clamp(roll, -1.0f, 1.0f);
+		this.throttleControlAnalog = Mth.clamp(throttle, -1.0f, 1.0f);
+
+		// Optional: you could use yaw/brake later (e.g., rudder or airbrake),
+		// but this physics model currently doesn't have a yaw input.
+	}
+
+	@Override
+	public boolean canSpawnSprintParticle()
+	{
+		return getDeltaMovement().length() > 0.25;
+	}
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\item\RCToyItem.java
+
+package rctoys.item;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.util.Mth;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.EntitySpawnReason;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.gameevent.GameEvent;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
+import org.jetbrains.annotations.Nullable;
+import org.joml.AxisAngle4f;
+import org.joml.Quaternionf;
+import rctoys.entity.AbstractRCEntity;
+
+public class RCToyItem extends Item
+{
+	private final EntityType<? extends AbstractRCEntity> type;
+
+	public RCToyItem(EntityType<? extends AbstractRCEntity> type, Item.Properties settings)
+	{
+		super(settings.stacksTo(1));
+		this.type = type;
+	}
+	
+	@Override
+	public InteractionResult use(Level world, Player user, InteractionHand hand)
+	{
+		ItemStack itemStack = user.getItemInHand(hand);
+		BlockHitResult blockHitResult = getPlayerPOVHitResult(world, user, ClipContext.Fluid.SOURCE_ONLY);
+		
+		if(!world.isClientSide() && blockHitResult.getType() == HitResult.Type.BLOCK)
+		{
+			BlockPos blockPos = blockHitResult.getBlockPos();
+			Direction direction = blockHitResult.getDirection();
+			BlockPos blockPos2;
+			
+			if(world.getBlockState(blockPos).getCollisionShape(world, blockPos).isEmpty())
+				blockPos2 = blockPos;
+			else
+				blockPos2 = blockPos.relative(direction);
+
+			if(createEntity(world, blockPos2, itemStack, user) != null)
+			{
+				if(!user.isCreative())
+					itemStack.shrink(1);
+				
+				world.gameEvent(user, GameEvent.ENTITY_PLACE, blockPos);
+			}
+
+			return InteractionResult.SUCCESS;
+		}
+		
+		return InteractionResult.PASS;
+	}
+
+	@Nullable
+	private AbstractRCEntity createEntity(Level world, BlockPos pos, ItemStack stack, Player player)
+	{
+		AbstractRCEntity abstractRCEntity = type.create(world, EntitySpawnReason.SPAWN_ITEM_USE);
+		
+		if(abstractRCEntity != null)
+		{
+			Vec3 vec3d = pos.getCenter();
+			abstractRCEntity.setPos(vec3d.x, vec3d.y, vec3d.z);
+			abstractRCEntity.setYRot(player.getYRot());
+			abstractRCEntity.setQuaternion(new Quaternionf(new AxisAngle4f(abstractRCEntity.getYRot() * -Mth.DEG_TO_RAD + Mth.PI, 0.0f, 1.0f, 0.0f)));
+			
+			if(stack.has(DataComponents.DYED_COLOR))
+				abstractRCEntity.setColor(stack.get(DataComponents.DYED_COLOR).rgb());
+			
+			world.addFreshEntity(abstractRCEntity);
+			
+			if(world instanceof ServerLevel serverWorld)
+				EntityType.createDefaultStackConfig(serverWorld, stack, player).accept(abstractRCEntity);
+		}
+		
+		return abstractRCEntity;
+	}
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\item\RemoteItem.java
+
+package rctoys.item;
+
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+import org.jetbrains.annotations.Nullable;
+import rctoys.RCToysMod;
+import rctoys.entity.AbstractRCEntity;
+
+public class RemoteItem extends Item
+{
+	public RemoteItem(Properties settings)
+	{
+		super(settings.stacksTo(1));
+	}
+	
+	@Override
+	public void inventoryTick(ItemStack stack, ServerLevel world, Entity entity, @Nullable EquipmentSlot slot)
+	{
+		AbstractRCEntity rcEntity = getRCEntity(stack, world);
+		
+		if(rcEntity != null && rcEntity.isEnabled() && slot != EquipmentSlot.MAINHAND)
+		{
+			rcEntity.setEnabled(false);
+			
+			if(entity instanceof Player)
+				((Player) entity).displayClientMessage(Component.translatable("item.rctoys.stopped_controlling", rcEntity.getName().getString()), false);
+		}
+	}
+	
+	@Override
+	public InteractionResult use(Level world, Player user, InteractionHand hand)
+	{
+		if(world.isClientSide())
+			return InteractionResult.PASS;
+		
+		ItemStack stack = user.getItemInHand(hand);
+		AbstractRCEntity rcEntity = getRCEntity(stack, world);
+		
+		if(rcEntity != null)
+		{
+			boolean enabled = rcEntity.isEnabled();
+			rcEntity.setEnabled(!enabled);
+			user.displayClientMessage(Component.translatable(enabled ? "item.rctoys.stopped_controlling" : "item.rctoys.started_controlling", rcEntity.getName().getString()), false);
+			return InteractionResult.SUCCESS;
+		}
+		
+		return InteractionResult.PASS;
+	}
+	
+	public static AbstractRCEntity getRCEntity(ItemStack stack, Level world)
+	{
+		if(stack.has(RCToysMod.REMOTE_LINK))
+		{
+			Entity entityByUUID = world.getEntity(stack.get(RCToysMod.REMOTE_LINK).uuid());
+			
+			if(entityByUUID != null && entityByUUID instanceof AbstractRCEntity)
+				return (AbstractRCEntity) entityByUUID;
+		}
+		
+		return null;
+	}
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\item\RemoteLinkComponent.java
+
+package rctoys.item;
+
+import java.util.UUID;
+import net.minecraft.core.UUIDUtil;
+import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.network.codec.StreamCodec;
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
+
+import io.netty.buffer.ByteBuf;
+
+public record RemoteLinkComponent(UUID uuid, String name)
+{
+	public static final Codec<RemoteLinkComponent> CODEC = RecordCodecBuilder.create(
+		instance -> instance.group(
+				UUIDUtil.AUTHLIB_CODEC.fieldOf("uuid").forGetter(RemoteLinkComponent::uuid),
+				Codec.STRING.fieldOf("name").forGetter(RemoteLinkComponent::name)
+			)
+			.apply(instance, RemoteLinkComponent::new)
+	);
+	
+	public static final StreamCodec<ByteBuf, RemoteLinkComponent> PACKET_CODEC = StreamCodec.composite(
+		UUIDUtil.STREAM_CODEC,
+		RemoteLinkComponent::uuid,
+		ByteBufCodecs.STRING_UTF8,
+		RemoteLinkComponent::name,
+		RemoteLinkComponent::new
+	);
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\mixin\ChunkMapMixin.java
+
+package rctoys.mixin;
+
+import net.minecraft.server.level.ChunkMap;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.LevelChunk;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.*;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import rctoys.entity.FakePlayerRC;
+
+@Mixin(ChunkMap.class)
+public abstract class ChunkMapMixin {
+    @Inject(method = "markChunkPendingToSend(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/world/level/chunk/LevelChunk;)V", at = @At("HEAD"), cancellable = true)
+    private static void markChunkPendingToSendInject(ServerPlayer serverPlayer, LevelChunk levelChunk, CallbackInfo info) {
+        if(serverPlayer instanceof FakePlayerRC) {
+            FakePlayerRC fakePlayer = (FakePlayerRC) serverPlayer;
+
+            if(fakePlayer.rcEntity.trackingPlayer != null) {
+                fakePlayer.rcEntity.trackingPlayer.connection.chunkSender.markChunkPendingToSend(levelChunk);
+                info.cancel();
+            }
+        }
+    }
+
+    @Inject(method = "dropChunk(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/world/level/ChunkPos;)V", at = @At("HEAD"), cancellable = true)
+    private static void dropChunkInject(ServerPlayer serverPlayer, ChunkPos chunkPos, CallbackInfo info) {
+        if(serverPlayer instanceof FakePlayerRC) {
+            FakePlayerRC fakePlayer = (FakePlayerRC) serverPlayer;
+
+            if(fakePlayer.rcEntity.trackingPlayer != null) {
+                fakePlayer.rcEntity.trackingPlayer.connection.chunkSender.dropChunk(fakePlayer.rcEntity.trackingPlayer, chunkPos);
+                info.cancel();
+            }
+        }
+    }
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\mixin\ChunkMapTrackedEntityMixin.java
+
+package rctoys.mixin;
+
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.Entity;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import rctoys.entity.AbstractRCEntity;
+
+@Mixin(targets = "net.minecraft.server.level.ChunkMap$TrackedEntity")
+public class ChunkMapTrackedEntityMixin {
+    @Shadow
+    @Final
+    private Entity entity;
+
+    @Inject(method = "removePlayer", at = @At("HEAD"), cancellable = true)
+    public void removePlayerInject(ServerPlayer serverPlayer, CallbackInfo info) {
+        if(this.entity instanceof AbstractRCEntity) {
+            AbstractRCEntity rcEntity = (AbstractRCEntity) this.entity;
+
+            if(rcEntity.trackingPlayer != null && rcEntity.trackingPlayer.getUUID().equals(serverPlayer.getUUID()))
+                info.cancel();
+        }
+    }
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\network\c2s\MotorSoundS2CPacket.java
+
+package rctoys.network.c2s;
+
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.Identifier;
+import rctoys.RCToysMod;
+
+public record MotorSoundS2CPacket(int entityID, boolean enable, Identifier sound) implements CustomPacketPayload
+{
+	public static final CustomPacketPayload.Type<MotorSoundS2CPacket> ID = new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "motor_sound"));
+    public static final StreamCodec<RegistryFriendlyByteBuf, MotorSoundS2CPacket> CODEC = CustomPacketPayload.codec(MotorSoundS2CPacket::write, MotorSoundS2CPacket::new);
+	
+    private MotorSoundS2CPacket(FriendlyByteBuf buffer)
+    {
+    	this(buffer.readInt(), buffer.readBoolean(), buffer.readIdentifier());
+    }
+    
+    private void write(FriendlyByteBuf buffer)
+    {
+    	buffer.writeInt(entityID);
+    	buffer.writeBoolean(enable);
+    	buffer.writeIdentifier(sound);
+    }
+    
+	@Override
+	public Type<? extends CustomPacketPayload> type()
+	{
+		return ID;
+	}
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\network\c2s\RemoteControlAnalogC2SPacket.java
+
+package rctoys.network.c2s;
+
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.Identifier;
+import rctoys.RCToysMod;
+
+/**
+ * Analog controls (granular pitch/roll/yaw/throttle).
+ * Ranges:
+ *  pitch:    -1..1
+ *  roll:     -1..1
+ *  yaw:      -1..1
+ *  throttle: -1..1
+ *  brake:    boolean
+ */
+public record RemoteControlAnalogC2SPacket(
+        float pitch,
+        float roll,
+        float yaw,
+        float throttle,
+        boolean brake
+) implements CustomPacketPayload {
+
+    public static final CustomPacketPayload.Type<RemoteControlAnalogC2SPacket> ID =
+            new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "remote_control_analog"));
+
+    public static final StreamCodec<RegistryFriendlyByteBuf, RemoteControlAnalogC2SPacket> CODEC =
+            StreamCodec.composite(
+                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::pitch,
+                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::roll,
+                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::yaw,
+                    ByteBufCodecs.FLOAT, RemoteControlAnalogC2SPacket::throttle,
+                    ByteBufCodecs.BOOL,  RemoteControlAnalogC2SPacket::brake,
+                    RemoteControlAnalogC2SPacket::new
+            );
+
+    @Override
+    public Type<? extends CustomPacketPayload> type() {
+        return ID;
+    }
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\network\c2s\RemoteControlC2SPacket.java
+
+package rctoys.network.c2s;
+
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.Identifier;
+import rctoys.RCToysMod;
+
+public record RemoteControlC2SPacket(int input) implements CustomPacketPayload
+{
+	public static final CustomPacketPayload.Type<RemoteControlC2SPacket> ID = new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "remote_control"));
+    public static final StreamCodec<RegistryFriendlyByteBuf, RemoteControlC2SPacket> CODEC = StreamCodec.composite(ByteBufCodecs.INT, RemoteControlC2SPacket::input, RemoteControlC2SPacket::new);
+	
+	@Override
+	public Type<? extends CustomPacketPayload> type()
+	{
+		return ID;
+	}
+}
+-------------------------------------------
+FILE: .\main\java\rctoys\network\c2s\TrackingPlayerC2SPacket.java
+
+package rctoys.network.c2s;
+
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.ByteBufCodecs;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.Identifier;
+import rctoys.RCToysMod;
+
+public record TrackingPlayerC2SPacket(int entityID, boolean enable) implements CustomPacketPayload
+{
+	public static final Type<TrackingPlayerC2SPacket> ID = new Type<>(Identifier.fromNamespaceAndPath(RCToysMod.MOD_ID, "controlling_player"));
+    public static final StreamCodec<RegistryFriendlyByteBuf, TrackingPlayerC2SPacket> CODEC = StreamCodec.composite(ByteBufCodecs.INT, TrackingPlayerC2SPacket::entityID, ByteBufCodecs.BOOL, TrackingPlayerC2SPacket::enable, TrackingPlayerC2SPacket::new);
+	
+	@Override
+	public Type<? extends CustomPacketPayload> type()
+	{
+		return ID;
+	}
+}
+-------------------------------------------
+FILE: .\main\resources\fabric.mod.json
+
+{
+	"schemaVersion": 1,
+	"id": "rctoys",
+	"version": "1.1.3",
+	"name": "RC Toys",
+	"description": "This mod adds remote controlled toys!",
+	"authors": [
+		"nanorover59"
+	],
+	"contact": {
+    	"homepage": "https://modrinth.com/mod/rc-toys",
+    	"sources": "https://github.com/nanorover59/RC-Toys",
+		"issues": "https://github.com/nanorover59/RC-Toys/issues"
+	},
+	"license": "MIT License",
+	"icon": "assets/rctoys/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"rctoys.RCToysMod"
+		],
+		"client": [
+			"rctoys.client.RCToysModClient"
+		]
+	},
+	"mixins": [
+        "rctoys.mixins.json",
+        {
+			"config": "rctoys.client.mixins.json",
+			"environment": "client"
+        }
+	],
+	"depends": {
+		"fabricloader": ">=0.18.2",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*"
+	},
+	"suggests": {
+		"another-mod": "*"
+	}
+}
+-------------------------------------------
+FILE: .\main\resources\rctoys.mixins.json
+
+{
+  "required": true,
+  "package": "rctoys.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "ChunkMapMixin",
+    "ChunkMapTrackedEntityMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\sounds.json
+
+{
+  "remote_link": {
+    "subtitle": "sound.rctoys.remote_link",
+    "sounds": [
+      "rctoys:remote_link"
+    ]
+  },
+  "car_loop": {
+    "subtitle": "sound.rctoys.car_loop",
+    "sounds": [
+      "rctoys:car_loop"
+    ]
+  },
+  "plane_loop": {
+    "subtitle": "sound.rctoys.plane_loop",
+    "sounds": [
+      "rctoys:plane_loop"
+    ]
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\items\aero_surface.json
+
+{
+  "model": {
+	"type": "minecraft:model",
+	"model": "rctoys:item/aero_surface"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\items\motor.json
+
+{
+  "model": {
+	"type": "minecraft:model",
+	"model": "rctoys:item/motor"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\items\propeller.json
+
+{
+  "model": {
+	"type": "minecraft:model",
+	"model": "rctoys:item/propeller"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\items\rc_car.json
+
+{
+  "model": {
+    "type": "minecraft:model",
+    "model": "rctoys:item/rc_car",
+	"tints": [
+	  {
+	    "type": "minecraft:dye",
+	    "default": -48340
+	  }
+	]
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\items\rc_plane.json
+
+{
+  "model": {
+    "type": "minecraft:model",
+    "model": "rctoys:item/rc_plane",
+	"tints": [
+	  {
+	    "type": "minecraft:dye",
+	    "default": -16201290
+	  }
+	]
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\items\remote.json
+
+{
+  "model": {
+	"type": "minecraft:model",
+	"model": "rctoys:item/remote"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\items\resonating_circuit.json
+
+{
+  "model": {
+	"type": "minecraft:model",
+	"model": "rctoys:item/resonating_circuit"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\items\wheels.json
+
+{
+  "model": {
+	"type": "minecraft:model",
+	"model": "rctoys:item/wheels"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\lang\en_us.json
+
+{
+	"rctoys.itemGroup": "RC Toys",
+	"item.rctoys.remote": "Remote Controller",
+	"item.rctoys.rc_car": "RC Car",
+	"item.rctoys.rc_plane": "RC Plane",
+	"item.rctoys.motor": "Motor",
+	"item.rctoys.resonating_circuit": "Resonating Circuit",
+	"item.rctoys.wheels": "Wheels",
+	"item.rctoys.propeller": "Propeller",
+	"item.rctoys.aero_surface": "Aero Surface",
+	"item.rctoys.remote_linked": "Linked to %s",
+	"item.rctoys.started_controlling": "Started controlling %s",
+	"item.rctoys.stopped_controlling": "Stopped controlling %s",
+	"entity.rctoys.rc_car": "RC Car",
+	"entity.rctoys.rc_plane": "RC Plane",
+	"entity.rctoys.remote_linked": "Remote link established",
+	"sound.rctoys.remote_link": "Remote",
+	"sound.rctoys.car_loop": "RC Car",
+	"sound.rctoys.plane_loop": "RC Plane",
+	"key.categories.rctoys": "RC Toys",
+	"key.rctoys.throttle_up": "Throttle Up",
+	"key.rctoys.throttle_down": "Throttle Down",
+	"key.rctoys.yaw_left": "Yaw Left",
+	"key.rctoys.yaw_right": "Yaw Right",
+	"key.rctoys.pitch_up": "Pitch Up",
+	"key.rctoys.pitch_down": "Pitch Down",
+	"key.rctoys.roll_left": "Roll Left",
+	"key.rctoys.roll_right": "Roll Right",
+	"key.rctoys.brake": "Brake",
+	"key.rctoys.exit_control": "Exit RC Control",
+	"key.rctoys.toggle_camera": "Toggle RC Camera"
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\models\item\aero_surface.json
+
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "rctoys:item/aero_surface"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\models\item\motor.json
+
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "rctoys:item/motor"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\models\item\propeller.json
+
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "rctoys:item/propeller"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\models\item\rc_car.json
+
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "rctoys:item/rc_car",
+    "layer1": "rctoys:item/rc_car_overlay"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\models\item\rc_plane.json
+
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "rctoys:item/rc_plane",
+    "layer1": "rctoys:item/rc_plane_overlay"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\models\item\remote.json
+
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "rctoys:item/remote"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\models\item\resonating_circuit.json
+
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "rctoys:item/resonating_circuit"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\assets\rctoys\models\item\wheels.json
+
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "rctoys:item/wheels"
+  }
+}
+-------------------------------------------
+FILE: .\main\resources\data\minecraft\tags\item\dyeable.json
+
+{
+  "replace": false,
+  "values": [
+    "rctoys:rc_car",
+	"rctoys:rc_plane"
+  ]
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\advancement\recipes\aero_surface.json
+
+{
+  "parent": "minecraft:recipes/root",
+  "rewards": {
+    "recipes": [
+      "rctoys:aero_surface"
+    ]
+  },
+  "criteria": {
+	"has_motor": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "rctoys:motor"
+            ]
+          }
+        ]
+      }
+    },
+    "has_the_recipe": {
+      "trigger": "minecraft:recipe_unlocked",
+      "conditions": {
+        "recipe": "rctoys:aero_surface"
+      }
+    }
+  },
+  "requirements": [
+    [
+	  "has_motor",
+      "has_the_recipe"
+    ]
+  ]
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\advancement\recipes\motor.json
+
+{
+  "parent": "minecraft:recipes/root",
+  "rewards": {
+    "recipes": [
+      "rctoys:motor"
+    ]
+  },
+  "criteria": {
+    "has_redstone": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "minecraft:redstone"
+            ]
+          }
+        ]
+      }
+    },
+	"has_copper": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "minecraft:copper_ingot"
+            ]
+          }
+        ]
+      }
+    },
+    "has_the_recipe": {
+      "trigger": "minecraft:recipe_unlocked",
+      "conditions": {
+        "recipe": "rctoys:motor"
+      }
+    }
+  },
+  "requirements": [
+    [
+      "has_redstone",
+	  "has_copper",
+      "has_the_recipe"
+    ]
+  ]
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\advancement\recipes\propeller.json
+
+{
+  "parent": "minecraft:recipes/root",
+  "rewards": {
+    "recipes": [
+      "rctoys:propeller"
+    ]
+  },
+  "criteria": {
+	"has_motor": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "rctoys:motor"
+            ]
+          }
+        ]
+      }
+    },
+    "has_the_recipe": {
+      "trigger": "minecraft:recipe_unlocked",
+      "conditions": {
+        "recipe": "rctoys:propeller"
+      }
+    }
+  },
+  "requirements": [
+    [
+	  "has_motor",
+      "has_the_recipe"
+    ]
+  ]
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\advancement\recipes\rc_car.json
+
+{
+  "parent": "minecraft:recipes/root",
+  "rewards": {
+    "recipes": [
+      "rctoys:rc_car"
+    ]
+  },
+  "criteria": {
+    "has_resonating_circuit": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "rctoys:resonating_circuit"
+            ]
+          }
+        ]
+      }
+    },
+	"has_motor": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "rctoys:motor"
+            ]
+          }
+        ]
+      }
+    },
+    "has_the_recipe": {
+      "trigger": "minecraft:recipe_unlocked",
+      "conditions": {
+        "recipe": "rctoys:rc_car"
+      }
+    }
+  },
+  "requirements": [
+    [
+      "has_resonating_circuit",
+	  "has_motor",
+      "has_the_recipe"
+    ]
+  ]
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\advancement\recipes\rc_plane.json
+
+{
+  "parent": "minecraft:recipes/root",
+  "rewards": {
+    "recipes": [
+      "rctoys:rc_plane"
+    ]
+  },
+  "criteria": {
+    "has_resonating_circuit": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "rctoys:resonating_circuit"
+            ]
+          }
+        ]
+      }
+    },
+	"has_motor": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "rctoys:motor"
+            ]
+          }
+        ]
+      }
+    },
+    "has_the_recipe": {
+      "trigger": "minecraft:recipe_unlocked",
+      "conditions": {
+        "recipe": "rctoys:rc_plane"
+      }
+    }
+  },
+  "requirements": [
+    [
+      "has_resonating_circuit",
+	  "has_motor",
+      "has_the_recipe"
+    ]
+  ]
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\advancement\recipes\remote.json
+
+{
+  "parent": "minecraft:recipes/root",
+  "rewards": {
+    "recipes": [
+      "rctoys:remote"
+    ]
+  },
+  "criteria": {
+    "has_resonating_circuit": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "rctoys:resonating_circuit"
+            ]
+          }
+        ]
+      }
+    },
+    "has_the_recipe": {
+      "trigger": "minecraft:recipe_unlocked",
+      "conditions": {
+        "recipe": "rctoys:remote"
+      }
+    }
+  },
+  "requirements": [
+    [
+      "has_resonating_circuit",
+      "has_the_recipe"
+    ]
+  ]
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\advancement\recipes\resonating_circuit.json
+
+{
+  "parent": "minecraft:recipes/root",
+  "rewards": {
+    "recipes": [
+      "rctoys:resonating_circuit"
+    ]
+  },
+  "criteria": {
+    "has_redstone": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "minecraft:redstone"
+            ]
+          }
+        ]
+      }
+    },
+	"has_amethyst_shard": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "minecraft:amethyst_shard"
+            ]
+          }
+        ]
+      }
+    },
+    "has_the_recipe": {
+      "trigger": "minecraft:recipe_unlocked",
+      "conditions": {
+        "recipe": "rctoys:resonating_circuit"
+      }
+    }
+  },
+  "requirements": [
+    [
+      "has_redstone",
+	  "has_amethyst_shard",
+      "has_the_recipe"
+    ]
+  ]
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\advancement\recipes\wheels.json
+
+{
+  "parent": "minecraft:recipes/root",
+  "rewards": {
+    "recipes": [
+      "rctoys:wheels"
+    ]
+  },
+  "criteria": {
+	"has_motor": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": [
+              "rctoys:motor"
+            ]
+          }
+        ]
+      }
+    },
+    "has_the_recipe": {
+      "trigger": "minecraft:recipe_unlocked",
+      "conditions": {
+        "recipe": "rctoys:wheels"
+      }
+    }
+  },
+  "requirements": [
+    [
+	  "has_motor",
+      "has_the_recipe"
+    ]
+  ]
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\recipe\aero_surface.json
+
+{
+    "type": "minecraft:crafting_shaped",
+    "pattern": [
+		"bbc",
+        "bab",
+        "cbb"
+    ],
+    "key": {
+      "a": "rctoys:motor",
+      "b": "#minecraft:planks",
+      "c": "minecraft:honeycomb"
+    },
+    "result": {
+        "id": "rctoys:aero_surface",
+        "count": 1
+    }
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\recipe\motor.json
+
+{
+    "type": "minecraft:crafting_shaped",
+    "pattern": [
+		" a ",
+        "bcb",
+        " a "
+    ],
+    "key": {
+      "a": "minecraft:iron_ingot",
+      "b": "minecraft:copper_ingot",
+      "c": "minecraft:redstone"
+    },
+    "result": {
+        "id": "rctoys:motor",
+        "count": 1
+    }
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\recipe\propeller.json
+
+{
+    "type": "minecraft:crafting_shaped",
+    "pattern": [
+		" c ",
+        "bab",
+        " c "
+    ],
+    "key": {
+      "a": "rctoys:motor",
+      "b": "minecraft:iron_ingot",
+      "c": "minecraft:stick"
+    },
+    "result": {
+        "id": "rctoys:propeller",
+        "count": 1
+    }
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\recipe\rc_car.json
+
+{
+    "type": "minecraft:crafting_shaped",
+    "pattern": [
+        "aaa",
+        "bcb"
+    ],
+    "key": {
+      "a": "minecraft:iron_ingot",
+      "b": "rctoys:wheels",
+      "c": "rctoys:resonating_circuit"
+    },
+    "result": {
+        "id": "rctoys:rc_car",
+        "count": 1
+    }
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\recipe\rc_plane.json
+
+{
+    "type": "minecraft:crafting_shaped",
+    "pattern": [
+		"dad",
+        "cbc",
+        "ddd"
+    ],
+    "key": {
+      "a": "rctoys:propeller",
+      "b": "rctoys:resonating_circuit",
+      "c": "rctoys:aero_surface",
+      "d": "#minecraft:planks"
+    },
+    "result": {
+        "id": "rctoys:rc_plane",
+        "count": 1
+    }
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\recipe\remote.json
+
+{
+    "type": "minecraft:crafting_shaped",
+    "pattern": [
+        "ca ",
+        "aba"
+    ],
+    "key": {
+      "a": "minecraft:iron_ingot",
+      "b": "rctoys:resonating_circuit",
+      "c": "minecraft:redstone_torch"
+    },
+    "result": {
+        "id": "rctoys:remote",
+        "count": 1
+    }
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\recipe\resonating_circuit.json
+
+{
+    "type": "minecraft:crafting_shaped",
+    "pattern": [
+        "cbc",
+        "aaa"
+    ],
+    "key": {
+      "a": "minecraft:lapis_lazuli",
+      "b": "minecraft:amethyst_shard",
+      "c": "minecraft:redstone"
+    },
+    "result": {
+        "id": "rctoys:resonating_circuit",
+        "count": 1
+    }
+}
+-------------------------------------------
+FILE: .\main\resources\data\rctoys\recipe\wheels.json
+
+{
+    "type": "minecraft:crafting_shaped",
+    "pattern": [
+		"c c",
+        "bab",
+        "c c"
+    ],
+    "key": {
+      "a": "rctoys:motor",
+      "b": "minecraft:iron_ingot",
+      "c": "minecraft:black_dye"
+    },
+    "result": {
+        "id": "rctoys:wheels",
+        "count": 1
+    }
+}

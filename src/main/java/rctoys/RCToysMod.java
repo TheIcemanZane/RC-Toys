@@ -30,6 +30,7 @@ import rctoys.item.RemoteItem;
 import rctoys.item.RemoteLinkComponent;
 import rctoys.network.c2s.MotorSoundS2CPacket;
 import rctoys.network.c2s.RemoteControlC2SPacket;
+import rctoys.network.c2s.RemoteControlAnalogC2SPacket;
 import rctoys.network.c2s.TrackingPlayerC2SPacket;
 
 public class RCToysMod implements ModInitializer
@@ -59,11 +60,16 @@ public class RCToysMod implements ModInitializer
 	@Override
 	public void onInitialize()
 	{
-		PayloadTypeRegistry.playS2C().register(MotorSoundS2CPacket.ID, MotorSoundS2CPacket.CODEC);
-		PayloadTypeRegistry.playC2S().register(RemoteControlC2SPacket.ID, RemoteControlC2SPacket.CODEC);
-        PayloadTypeRegistry.playC2S().register(TrackingPlayerC2SPacket.ID, TrackingPlayerC2SPacket.CODEC);
-		ServerPlayNetworking.registerGlobalReceiver(RemoteControlC2SPacket.ID, (payload, context) -> AbstractRCEntity.receiveControl(payload, context));
-        ServerPlayNetworking.registerGlobalReceiver(TrackingPlayerC2SPacket.ID, (payload, context) -> AbstractRCEntity.receiveTrackingPlayer(payload, context));
+	    PayloadTypeRegistry.playS2C().register(MotorSoundS2CPacket.ID, MotorSoundS2CPacket.CODEC);
+	
+	    PayloadTypeRegistry.playC2S().register(RemoteControlC2SPacket.ID, RemoteControlC2SPacket.CODEC);
+	    PayloadTypeRegistry.playC2S().register(RemoteControlAnalogC2SPacket.ID, RemoteControlAnalogC2SPacket.CODEC); // <-- ADD
+	
+	    PayloadTypeRegistry.playC2S().register(TrackingPlayerC2SPacket.ID, TrackingPlayerC2SPacket.CODEC);
+	
+	    ServerPlayNetworking.registerGlobalReceiver(RemoteControlC2SPacket.ID, (payload, context) -> AbstractRCEntity.receiveControl(payload, context));
+	    ServerPlayNetworking.registerGlobalReceiver(RemoteControlAnalogC2SPacket.ID, (payload, context) -> AbstractRCEntity.receiveAnalogControl(payload, context)); // <-- ADD
+	    ServerPlayNetworking.registerGlobalReceiver(TrackingPlayerC2SPacket.ID, (payload, context) -> AbstractRCEntity.receiveTrackingPlayer(payload, context));
 	}
 
 	private static <T extends Entity> EntityType<T> registerEntity(String id, EntityType.Builder<T> type)

@@ -31,6 +31,7 @@ import rctoys.RCToysMod;
 import rctoys.item.RemoteItem;
 import rctoys.item.RemoteLinkComponent;
 import rctoys.network.c2s.MotorSoundS2CPacket;
+import rctoys.network.c2s.RemoteControlAnalogC2SPacket;
 import rctoys.network.c2s.RemoteControlC2SPacket;
 import rctoys.network.c2s.TrackingPlayerC2SPacket;
 
@@ -46,14 +47,20 @@ public abstract class AbstractRCEntity extends Entity
 	private static final EntityDataAccessor<Float> QW = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.FLOAT);
 	private static final EntityDataAccessor<Float> THROTTLE = SynchedEntityData.defineId(AbstractRCEntity.class, EntityDataSerializers.FLOAT);
 
-    private static final TicketType CHUNK_TICKET = TicketType.FORCED;
+	// --- Analog control state (server-side) ---
+	protected float ctrlPitch;     // -1..1
+	protected float ctrlRoll;      // -1..1
+	protected float ctrlYaw;       // -1..1
+	protected float ctrlThrottle;  // -1..1
+	protected boolean ctrlBrake;
+	protected int ctrlTicksSinceUpdate = 0;
 
 	private final InterpolationHandler interpolator = new InterpolationHandler(this, 3);
 	public Quaternionf clientQuaternion;
 	public Quaternionf clientQuaternionPrevious;
 
-    public FakePlayerRC fakePlayer;
-    public ServerPlayer trackingPlayer;
+	public FakePlayerRC fakePlayer;
+	public ServerPlayer trackingPlayer;
 
 	public AbstractRCEntity(EntityType<?> entityType, Level world)
 	{
@@ -72,7 +79,7 @@ public abstract class AbstractRCEntity extends Entity
 		builder.define(THROTTLE, Float.valueOf(0.0f));
 	}
 
-    public void setColor(int color)
+	public void setColor(int color)
 	{
 		this.entityData.set(COLOR, color);
 	}
@@ -81,14 +88,14 @@ public abstract class AbstractRCEntity extends Entity
 	{
 		return this.entityData.get(COLOR).intValue();
 	}
-	
+
 	public abstract int getDefaultColor();
 
 	public void setEnabled(boolean enabled)
 	{
 		if(enabled && !isEnabled())
 			this.playSound(RCToysMod.REMOTE_LINK_SOUND, 2.0f, 0.7f);
-		
+
 		this.entityData.set(ENABLED, enabled);
 	}
 
@@ -107,19 +114,24 @@ public abstract class AbstractRCEntity extends Entity
 
 	public Quaternionf getQuaternion()
 	{
-		return new Quaternionf(this.entityData.get(QX).floatValue(), this.entityData.get(QY).floatValue(), this.entityData.get(QZ).floatValue(), this.entityData.get(QW).floatValue());
+		return new Quaternionf(
+				this.entityData.get(QX).floatValue(),
+				this.entityData.get(QY).floatValue(),
+				this.entityData.get(QZ).floatValue(),
+				this.entityData.get(QW).floatValue()
+		);
 	}
-	
+
 	public Quaternionf getLerpedQuaternion(float tickProgress)
 	{
 		if(this.clientQuaternion == null)
 			return new Quaternionf();
 		else if(tickProgress == 1.0f || this.clientQuaternionPrevious == null)
 			return this.clientQuaternion;
-		
+
 		return new Quaternionf(this.clientQuaternionPrevious).slerp(this.clientQuaternion, tickProgress);
 	}
-	
+
 	public void setThrottle(float throttle)
 	{
 		this.entityData.set(THROTTLE, throttle);
@@ -155,22 +167,69 @@ public abstract class AbstractRCEntity extends Entity
 		}
 		else
 		{
+			if (this.ctrlTicksSinceUpdate < 1_000_000) this.ctrlTicksSinceUpdate++;
+
 			tickPhysics();
 			setQuaternion(updateQuaternion());
 
 			for(Entity other : this.level().getEntities(this, this.getBoundingBox()))
-		       this.push(other);
+				this.push(other);
 
-            if(this.fakePlayer != null)
-                moveFakePlayer();
+			if(this.fakePlayer != null)
+				moveFakePlayer();
 		}
 	}
 
 	public abstract void tickPhysics();
-
 	public abstract Quaternionf updateQuaternion();
 
+	/**
+	 * Legacy control: 6 booleans packed from the old bitmask.
+	 * Indices: 0=up, 1=down, 2=left, 3=right, 4=jump, 5=shift
+	 */
 	public abstract void remoteControlInput(boolean[] inputArray);
+
+	/**
+	 * Store analog state + reset stale timer.
+	 * Subclasses that implement real analog handling should call this,
+	 * NOT the fallback mapping.
+	 */
+	protected final void storeAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	{
+		this.ctrlPitch = clamp11(pitch);
+		this.ctrlRoll = clamp11(roll);
+		this.ctrlYaw = clamp11(yaw);
+		this.ctrlThrottle = clamp11(throttle);
+		this.ctrlBrake = brake;
+		this.ctrlTicksSinceUpdate = 0;
+	}
+
+	/**
+	 * Analog control entrypoint (default behavior):
+	 * Store state, then convert analog -> legacy 6 booleans and call remoteControlInput(...).
+	 */
+	public void remoteControlAnalogInput(float pitch, float roll, float yaw, float throttle, boolean brake)
+	{
+		storeAnalogInput(pitch, roll, yaw, throttle, brake);
+
+		boolean[] input = new boolean[6];
+
+		// NOTE: This mapping is "generic legacy" and may not match PlaneEntity's meaning.
+		input[0] = this.ctrlPitch > 0.25f;   // up
+		input[1] = this.ctrlPitch < -0.25f;  // down
+		input[2] = this.ctrlRoll < -0.25f;   // left
+		input[3] = this.ctrlRoll > 0.25f;    // right
+		input[4] = this.ctrlThrottle > 0.25f;   // jump
+		input[5] = this.ctrlThrottle < -0.25f;  // shift
+
+		remoteControlInput(input);
+	}
+
+	protected static float clamp11(float v) {
+		if (v < -1.0f) return -1.0f;
+		if (v > 1.0f) return 1.0f;
+		return v;
+	}
 
 	public abstract Item asItem();
 
@@ -210,7 +269,6 @@ public abstract class AbstractRCEntity extends Entity
 
 		if(!stack.is(RCToysMod.REMOTE))
 		{
-			// Miniature players can ride RC toys :)
 			if(player.getScale() <= 0.31)
 			{
 				player.startRiding(this);
@@ -246,7 +304,7 @@ public abstract class AbstractRCEntity extends Entity
 	{
 		this.kill(world);
 
-        if(world.getGameRules().get(GameRules.ENTITY_DROPS))
+		if(world.getGameRules().get(GameRules.ENTITY_DROPS))
 		{
 			ItemStack itemStack = new ItemStack(asItem());
 			itemStack.set(DataComponents.CUSTOM_NAME, this.getCustomName());
@@ -271,10 +329,10 @@ public abstract class AbstractRCEntity extends Entity
 		cleanRemoteLinks(getUUID());
 	}
 
-    public SoundEvent getSoundLoop()
-    {
-        return RCToysMod.CAR_LOOP_SOUND;
-    }
+	public SoundEvent getSoundLoop()
+	{
+		return RCToysMod.CAR_LOOP_SOUND;
+	}
 
 	@Override
 	public void startSeenByPlayer(ServerPlayer player)
@@ -288,12 +346,12 @@ public abstract class AbstractRCEntity extends Entity
 		ServerPlayNetworking.send(player, new MotorSoundS2CPacket(getId(), false, getSoundLoop().location()));
 	}
 
-    private void moveFakePlayer() {
-        ServerLevel serverLevel = (ServerLevel) this.level();
-        this.fakePlayer.setOldPosAndRot();
-        this.fakePlayer.setPos(this.position());
-        serverLevel.getChunkSource().move(this.fakePlayer);
-    }
+	private void moveFakePlayer() {
+		ServerLevel serverLevel = (ServerLevel) this.level();
+		this.fakePlayer.setOldPosAndRot();
+		this.fakePlayer.setPos(this.position());
+		serverLevel.getChunkSource().move(this.fakePlayer);
+	}
 
 	private void cleanRemoteLinks(UUID rcUUID)
 	{
@@ -316,7 +374,12 @@ public abstract class AbstractRCEntity extends Entity
 	protected void readAdditionalSaveData(ValueInput view)
 	{
 		setColor(view.getIntOr("color", CommonColors.WHITE));
-		setQuaternion(new Quaternionf(view.getFloatOr("qx", 0.0f), view.getFloatOr("qy", 0.0f), view.getFloatOr("qz", 0.0f), view.getFloatOr("qw", 0.0f)).normalize());
+		setQuaternion(new Quaternionf(
+				view.getFloatOr("qx", 0.0f),
+				view.getFloatOr("qy", 0.0f),
+				view.getFloatOr("qz", 0.0f),
+				view.getFloatOr("qw", 0.0f)
+		).normalize());
 	}
 
 	@Override
@@ -328,6 +391,10 @@ public abstract class AbstractRCEntity extends Entity
 		view.putFloat("qz", this.entityData.get(QZ).floatValue());
 		view.putFloat("qw", this.entityData.get(QW).floatValue());
 	}
+
+	// -------------------------
+	// Network receivers
+	// -------------------------
 
 	public static void receiveControl(RemoteControlC2SPacket payload, ServerPlayNetworking.Context context)
 	{
@@ -342,56 +409,77 @@ public abstract class AbstractRCEntity extends Entity
 				UUID rcUUID = stack.get(RCToysMod.REMOTE_LINK).uuid();
 				Entity entity = player.level().getEntity(rcUUID);
 
-				if(entity != null && entity instanceof AbstractRCEntity)
-                    ((AbstractRCEntity) entity).remoteControlInput(unpackInput(input));
+				if(entity instanceof AbstractRCEntity rc)
+					rc.remoteControlInput(unpackInput(input));
 			}
 		});
 	}
-	
+
+	public static void receiveAnalogControl(RemoteControlAnalogC2SPacket payload, ServerPlayNetworking.Context context)
+	{
+		context.server().execute(() -> {
+			ServerPlayer player = context.player();
+			ItemStack stack = player.getMainHandItem();
+
+			if(stack.is(RCToysMod.REMOTE) && stack.has(RCToysMod.REMOTE_LINK))
+			{
+				UUID rcUUID = stack.get(RCToysMod.REMOTE_LINK).uuid();
+				Entity entity = player.level().getEntity(rcUUID);
+
+				if(entity instanceof AbstractRCEntity rc && rc.isEnabled())
+				{
+					rc.remoteControlAnalogInput(
+							payload.pitch(),
+							payload.roll(),
+							payload.yaw(),
+							payload.throttle(),
+							payload.brake()
+					);
+				}
+			}
+		});
+	}
+
 	public static boolean[] unpackInput(int input)
 	{
 		boolean[] inputArray = new boolean[6];
 
 		for(int i = 0; i < 6; i++)
 			inputArray[i] = ((input >> i) & 1) == 1;
-		
+
 		return inputArray;
 	}
 
-    public static void receiveTrackingPlayer(TrackingPlayerC2SPacket payload, ServerPlayNetworking.Context context) {
-        int entityID = payload.entityID();
-        boolean enable = payload.enable();
+	public static void receiveTrackingPlayer(TrackingPlayerC2SPacket payload, ServerPlayNetworking.Context context) {
+		int entityID = payload.entityID();
+		boolean enable = payload.enable();
 
-        context.server().execute(() -> {
-            ServerPlayer player = context.player();
-            ServerLevel serverLevel = player.level();
-            Entity entity = serverLevel.getEntity(entityID);
+		context.server().execute(() -> {
+			ServerPlayer player = context.player();
+			ServerLevel serverLevel = player.level();
+			Entity entity = serverLevel.getEntity(entityID);
 
-            if(entity != null && entity instanceof AbstractRCEntity) {
-                AbstractRCEntity rcEntity = ((AbstractRCEntity) entity);
+			if(entity instanceof AbstractRCEntity rcEntity) {
+				if(enable) {
+					rcEntity.trackingPlayer = player;
 
-                if(enable) {
-                    rcEntity.trackingPlayer = player;
-
-                    if (rcEntity.fakePlayer == null) {
-                        GameProfile gameProfile = new GameProfile(UUID.randomUUID(), "RC_Toy");
-                        rcEntity.fakePlayer = new FakePlayerRC(serverLevel, gameProfile, rcEntity);
-                        serverLevel.addNewPlayer(rcEntity.fakePlayer);
-                    }
-                }
-                else {
-                    // Reset the tracking player's client chunk view and clear the reference.
-                    if(rcEntity.trackingPlayer != null) {
-                        rcEntity.trackingPlayer.setChunkTrackingView(ChunkTrackingView.EMPTY);
-                        rcEntity.trackingPlayer = null;
-                    }
-                    // Discard the chunk loading fake player.
-                    if(rcEntity.fakePlayer != null) {
-                        serverLevel.removePlayerImmediately(rcEntity.fakePlayer, RemovalReason.DISCARDED);
-                        rcEntity.fakePlayer = null;
-                    }
-                }
-            }
-        });
-    }
+					if (rcEntity.fakePlayer == null) {
+						GameProfile gameProfile = new GameProfile(UUID.randomUUID(), "RC_Toy");
+						rcEntity.fakePlayer = new FakePlayerRC(serverLevel, gameProfile, rcEntity);
+						serverLevel.addNewPlayer(rcEntity.fakePlayer);
+					}
+				}
+				else {
+					if(rcEntity.trackingPlayer != null) {
+						rcEntity.trackingPlayer.setChunkTrackingView(ChunkTrackingView.EMPTY);
+						rcEntity.trackingPlayer = null;
+					}
+					if(rcEntity.fakePlayer != null) {
+						serverLevel.removePlayerImmediately(rcEntity.fakePlayer, RemovalReason.DISCARDED);
+						rcEntity.fakePlayer = null;
+					}
+				}
+			}
+		});
+	}
 }
